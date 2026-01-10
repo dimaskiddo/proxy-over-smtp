@@ -29,7 +29,7 @@ docker run -d \
   -p <PROXY_SERVER_PORT>:<PROXY_SERVER_PORT>
   --name proxy-over-smtp-server \
   --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -mode server -server <PROXY_SERVER_PORT>
+  proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode server -server <PROXY_SERVER_PORT>
 
 # Example of Usage
 
@@ -37,7 +37,7 @@ docker run -d \
   -p 465:465
   --name proxy-over-smtp-server \
   --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -mode server -server "0.0.0.0:465"
+  proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
 ```
 
 3) Run the following command on your Terminal or PowerShell for the client side
@@ -46,7 +46,7 @@ docker run -d \
   -p <CLIENT_PROXY_PORT>:<CLIENT_PROXY_PORT>
   --name proxy-over-smtp-client \
   --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
+  proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
 
 # Example of Usage
 
@@ -54,7 +54,7 @@ docker run -d \
   -p 1080:1080
   --name proxy-over-smtp-client \
   --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+  proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
 ```
 
 4) Now open your favourite browser and set the Connection setting to use Proxy
@@ -72,14 +72,14 @@ docker run -d \
 # MacOS / Linux
 chmod 755 proxy-over-smtp
 # -- Example of Usage
-# -- ./proxy-over-smtp -mode server -server <PROXY_SERVER_PORT>
-./proxy-over-smtp -mode server -server "0.0.0.0:465"
+# -- ./proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode server -server <PROXY_SERVER_PORT>
+./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
 
 # Windows
 # You can double click it or using PowerShell
 # -- Example of Usage
-# -- .\proxy-over-smtp.exe -mode server -server <PROXY_SERVER_PORT>
-.\proxy-over-smtp.exe -mode server -server "0.0.0.0:465"
+# -- .\proxy-over-smtp.exe -secret <YOUR_SECRET_WORD> -mode server -server <PROXY_SERVER_PORT>
+.\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
 ```
 
 4) Run the pre-build binary for the client side
@@ -87,14 +87,14 @@ chmod 755 proxy-over-smtp
 # MacOS / Linux
 chmod 755 proxy-over-smtp
 # -- Example of Usage
-# -- ./proxy-over-smtp -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
-./proxy-over-smtp -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+# -- ./proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
+./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
 
 # Windows
 # You can double click it or using PowerShell
 # -- Example of Usage
-# -- .\proxy-over-smtp.exe -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
-.\proxy-over-smtp.exe -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+# -- .\proxy-over-smtp.exe -secret <YOUR_SECRET_WORD> -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
+.\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
 ```
 
 5) Now open your favourite browser and set the Connection setting to use Proxy

@@ -40,7 +40,7 @@ func init() {
 	flag.StringVar(&ClientListenAddr, "client", "0.0.0.0:1080", "Client listen address")
 	flag.StringVar(&ClientRemoteAddr, "remote", "127.0.0.1:465", "Server remote address")
 	flag.StringVar(&ServerListenAddr, "server", "0.0.0.0:465", "Server listen address")
-	flag.StringVar(&AuthSecret, "secret", "THIS_IS_AUTH_SECRET", "Authentication secret")
+	flag.StringVar(&AuthSecret, "secret", "THIS_IS_YOUR_SECRET_WORD", "Authentication secret")
 	flag.StringVar(&AuditLogFile, "log-file", "./proxy-over-smtp.log", "Log file path")
 	flag.Parse()
 
