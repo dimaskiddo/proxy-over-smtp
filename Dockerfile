@@ -6,7 +6,7 @@ WORKDIR /usr/src/app
 
 COPY . ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -a -o main ./main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -a -o main .
 
 
 # Final Image

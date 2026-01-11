@@ -33,7 +33,7 @@ publish:
 
 build:
 	make vendor
-	CGO_ENABLED=$(BUILD_CGO_ENABLED) go build -ldflags="-s -w" -trimpath -a -o $(SERVICE_NAME) ./main.go
+	CGO_ENABLED=$(BUILD_CGO_ENABLED) go build -ldflags="-s -w" -trimpath -a -o $(SERVICE_NAME) .
 	echo "Build '$(SERVICE_NAME)' complete."
 
 run:

@@ -2,7 +2,7 @@ before:
   hooks:
     - make vendor
 builds:
-- main: ./main.go
+- main: .
   env:
     - CGO_ENABLED=0
   ldflags:
