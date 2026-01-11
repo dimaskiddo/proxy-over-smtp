@@ -111,7 +111,7 @@ func handleServer(ctx context.Context, conn net.Conn) {
 				return
 			}
 
-			// 4. Connect to Target
+			// 5. Connect to Target
 			dest, err := net.DialTimeout("tcp", target, DefaultTimeout)
 			if err != nil {
 				auditLog.Printf("Failed to Reach %s", target)
