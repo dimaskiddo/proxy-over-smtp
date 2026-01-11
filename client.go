@@ -101,9 +101,11 @@ func getSession(ctx context.Context) (*yamux.Session, error) {
 	}{reader, remote}
 
 	stream := newXorStream(rw, AuthSecret)
-
 	conf := yamux.DefaultConfig()
+
+	conf.EnableKeepAlive = true
 	conf.KeepAliveInterval = 15 * time.Second
+	conf.ConnectionWriteTimeout = 5 * time.Second
 
 	sess, err := yamux.Client(stream, conf)
 	if err != nil {
