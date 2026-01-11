@@ -1,6 +1,15 @@
 package main
 
-import "io"
+import (
+	"io"
+	"sync"
+)
+
+var (
+	bufferPool = sync.Pool{
+		New: func() interface{} { return make([]byte, BufferSize) },
+	}
+)
 
 // --- Unified Relay Implementation ---
 func relay(conn1, conn2 io.ReadWriter) {

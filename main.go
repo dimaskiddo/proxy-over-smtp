@@ -18,10 +18,7 @@ const (
 )
 
 var (
-	auditLog   *log.Logger
-	bufferPool = sync.Pool{
-		New: func() interface{} { return make([]byte, BufferSize) },
-	}
+	auditLog    *log.Logger
 	activeConns sync.WaitGroup
 )
 

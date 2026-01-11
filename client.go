@@ -1,12 +1,22 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/hashicorp/yamux"
+)
+
+var (
+	session     *yamux.Session
+	sessionLock sync.Mutex
 )
 
 // --- Client Implementation ---
@@ -49,40 +59,92 @@ func handleClient(ctx context.Context, local net.Conn) {
 		local.Close()
 	}()
 
-	remote, err := net.DialTimeout("tcp", ClientRemoteAddr, DefaultTimeout)
+	sess, err := getSession(ctx)
 	if err != nil {
 		return
 	}
-	defer remote.Close()
 
-	if !clientHandshake(remote) {
+	remoteStream, err := sess.Open()
+	if err != nil {
 		return
 	}
+	defer remoteStream.Close()
 
-	stream := newXorStream(remote, AuthSecret)
-	relay(local, stream)
+	relay(local, remoteStream)
 }
 
-func clientHandshake(conn net.Conn) bool {
+func getSession(ctx context.Context) (*yamux.Session, error) {
+	sessionLock.Lock()
+	defer sessionLock.Unlock()
+
+	if session != nil && !session.IsClosed() {
+		return session, nil
+	}
+
+	// 1. Connect to Server
+	remote, err := net.DialTimeout("tcp", ClientRemoteAddr, DefaultTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	// 2. SMTP Handshake
+	reader := bufio.NewReader(remote)
+	if !clientHandshake(remote, reader) {
+		remote.Close()
+		return nil, fmt.Errorf("SMTP Handshake Failed")
+	}
+
+	// 3. XOR Strem with Multiplexer
+	rw := &struct {
+		io.Reader
+		io.Writer
+	}{reader, remote}
+
+	stream := newXorStream(rw, AuthSecret)
+
+	conf := yamux.DefaultConfig()
+	conf.KeepAliveInterval = 15 * time.Second
+
+	sess, err := yamux.Client(stream, conf)
+	if err != nil {
+		return nil, err
+	}
+
+	session = sess
+	return session, nil
+}
+
+func clientHandshake(conn net.Conn, r *bufio.Reader) bool {
 	conn.SetDeadline(time.Now().Add(DefaultTimeout))
 	defer conn.SetDeadline(time.Time{})
 
-	buf := make([]byte, 1024)
-
-	n, err := conn.Read(buf)
-	if err != nil || !strings.HasPrefix(string(buf[:n]), "220") {
+	// SMTP Read 220
+	line, err := r.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "220") {
 		return false
 	}
+
+	// SMTP Send EHLO
 	fmt.Fprintf(conn, "EHLO %s\r\n", AuthSecret)
 
-	n, err = conn.Read(buf)
-	if err != nil || !strings.HasPrefix(string(buf[:n]), "250") {
-		return false
+	// SMTP Read 250
+	for {
+		line, err = r.ReadString('\n')
+		if err != nil {
+			return false
+		}
+
+		if strings.HasPrefix(line, "250 ") {
+			break
+		}
 	}
+
+	// SMTP Send Data
 	fmt.Fprintf(conn, "DATA\r\n")
 
-	n, err = conn.Read(buf)
-	if err != nil || !strings.HasPrefix(string(buf[:n]), "354") {
+	// SMTP Read 354
+	line, err = r.ReadString('\n')
+	if err != nil || !strings.HasPrefix(line, "354") {
 		return false
 	}
 

@@ -1,43 +1,60 @@
 package main
 
-import "io"
+import (
+	"io"
+	"sync"
+)
 
 // --- XOR Implementation ---
 type xorStream struct {
 	inner io.ReadWriter
 	key   []byte
-	pos   int
+	rPos  int
+	wPos  int
+	muR   sync.Mutex
+	muW   sync.Mutex
 }
 
 func newXorStream(rw io.ReadWriter, key string) *xorStream {
-	return &xorStream{inner: rw, key: []byte(key), pos: 0}
+	return &xorStream{
+		inner: rw,
+		key:   []byte(key),
+	}
 }
 
 func (x *xorStream) Read(p []byte) (n int, err error) {
+	x.muR.Lock()
+	defer x.muR.Unlock()
+
 	n, err = x.inner.Read(p)
 	if n > 0 {
 		keyLen := len(x.key)
 		for i := 0; i < n; i++ {
-			p[i] ^= x.key[(x.pos+i)%keyLen]
+			p[i] ^= x.key[(x.rPos+i)%keyLen]
 		}
 
-		x.pos = (x.pos + n) % keyLen
+		x.rPos = (x.rPos + n) % keyLen
 	}
 
 	return
 }
 
 func (x *xorStream) Write(p []byte) (n int, err error) {
-	keyLen := len(x.key)
+	x.muW.Lock()
+	defer x.muW.Unlock()
 
+	keyLen := len(x.key)
+	buf := make([]byte, len(p))
 	for i := 0; i < len(p); i++ {
-		p[i] ^= x.key[(x.pos+i)%keyLen]
+		buf[i] = p[i] ^ x.key[(x.wPos+i)%keyLen]
 	}
 
-	n, err = x.inner.Write(p)
-	x.pos = (x.pos + n) % keyLen
+	n, err = x.inner.Write(buf)
+	if n > 0 {
+		x.wPos = (x.wPos + n) % keyLen
+	}
 
-	return
+	return n, err
 }
 
 func (x *xorStream) Close() error {
