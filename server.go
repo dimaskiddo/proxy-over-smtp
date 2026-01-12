@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hashicorp/yamux"
+	"github.com/xtaci/smux"
 )
 
 // --- Server Implementation ---
@@ -86,13 +86,13 @@ func handleServer(ctx context.Context, conn net.Conn) {
 	}{reader, conn}
 
 	stream := newXorStream(rw, AuthSecret)
-	conf := yamux.DefaultConfig()
+	conf := smux.DefaultConfig()
 
-	conf.EnableKeepAlive = true
+	conf.KeepAliveDisabled = false
 	conf.KeepAliveInterval = 15 * time.Second
-	conf.ConnectionWriteTimeout = 5 * time.Second
+	conf.KeepAliveTimeout = 60 * time.Second
 
-	sess, err := yamux.Server(stream, conf)
+	sess, err := smux.Server(stream, conf)
 	if err != nil {
 		return
 	}
@@ -104,7 +104,7 @@ func handleServer(ctx context.Context, conn net.Conn) {
 			break
 		}
 
-		go func(vs net.Conn) {
+		go func(vs io.ReadWriteCloser) {
 			defer vs.Close()
 
 			// 4. SOCKS5 Negotiation

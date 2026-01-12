@@ -15,7 +15,7 @@ func negotiateSocks5Server(rw io.ReadWriter) (string, error) {
 	}
 
 	if header[0] != 0x05 {
-		return "", fmt.Errorf("wrong socks version")
+		return "", fmt.Errorf("Wrong SOCKS version. Please use SOCKS version 5")
 	}
 
 	methods := make([]byte, int(header[1]))

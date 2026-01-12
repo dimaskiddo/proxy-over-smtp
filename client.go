@@ -11,11 +11,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/yamux"
+	"github.com/xtaci/smux"
 )
 
 var (
-	session     *yamux.Session
+	session     *smux.Session
 	sessionLock sync.Mutex
 )
 
@@ -73,7 +73,7 @@ func handleClient(ctx context.Context, local net.Conn) {
 	relay(local, remoteStream)
 }
 
-func getSession(ctx context.Context) (*yamux.Session, error) {
+func getSession(ctx context.Context) (*smux.Session, error) {
 	sessionLock.Lock()
 	defer sessionLock.Unlock()
 
@@ -101,13 +101,13 @@ func getSession(ctx context.Context) (*yamux.Session, error) {
 	}{reader, remote}
 
 	stream := newXorStream(rw, AuthSecret)
-	conf := yamux.DefaultConfig()
+	conf := smux.DefaultConfig()
 
-	conf.EnableKeepAlive = true
+	conf.KeepAliveDisabled = false
 	conf.KeepAliveInterval = 15 * time.Second
-	conf.ConnectionWriteTimeout = 5 * time.Second
+	conf.KeepAliveTimeout = 60 * time.Second
 
-	sess, err := yamux.Client(stream, conf)
+	sess, err := smux.Client(stream, conf)
 	if err != nil {
 		return nil, err
 	}
