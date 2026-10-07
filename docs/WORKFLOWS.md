@@ -132,6 +132,22 @@ Auto-update runs the same drain before it re-executes.
 
 ---
 
+## Verifying Throughput
+
+Run these by hand. Nothing here is a CI gate: shared runners are too noisy to assert a rate on, and the ordinary tests are what catch a regression in the copy path.
+
+| Step | Command | Expect |
+|---|---|---|
+| Per-layer numbers | `make bench` (or `make bench-short`) | Relay near memory speed, AES seal above 2 GB/s, XOR seal above 400 MB/s, `BenchmarkProxyThroughput` per cipher and stream count |
+| Direct baseline | `curl -o /dev/null --limit-rate 100M http://host/file` | Transfer finishes at the cap, so the link is the limit |
+| Through the proxy | Same URL with `-x socks5h://127.0.0.1:1080` | Within 80% of the direct run at caps up to 100M |
+| Single long-fat stream | One `iperf3 -c host` through the client | Underruns on a high-RTT link: that is the `window / RTT` ceiling, not a fault |
+| Multi-stream | Several transfers at once, or `iperf3 -P 8` | Aggregate approaches line rate; streams needed per RTT in [Architecture](ARCHITECTURE.md#throughput) |
+
+Cipher stays `--cipher aes` for these: both ciphers measure the same end to end at the CPU ceiling, and AES is the default.
+
+---
+
 ## File Naming Conventions
 
 | File | Location | Pattern |

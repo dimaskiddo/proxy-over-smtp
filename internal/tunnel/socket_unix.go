@@ -13,9 +13,9 @@ func setsockopt(fd uintptr, level, opt, val int) error {
 	return unix.SetsockoptInt(int(fd), level, opt, val)
 }
 
+// Send and receive buffers are left to kernel autotuning: a fixed small buffer caps throughput at
+// roughly buffer/RTT.
 var dialOpts = []sockOpt{
-	{"SO_RCVBUF", unix.SOL_SOCKET, unix.SO_RCVBUF, sockBuffer},
-	{"SO_SNDBUF", unix.SOL_SOCKET, unix.SO_SNDBUF, sockBuffer},
 	{"TCP_NODELAY", unix.IPPROTO_TCP, unix.TCP_NODELAY, 1},
 }
 

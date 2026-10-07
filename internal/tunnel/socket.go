@@ -35,13 +35,6 @@ func setInts(c syscall.RawConn, opts []sockOpt) error {
 	return serr
 }
 
-const (
-	// sockBuffer is the kernel send and receive buffer for every tunnel socket. It favors many
-	// small flows over bulk speed: throughput per connection is capped near buffer/RTT, and
-	// setting it turns off the kernel's buffer autotuning.
-	sockBuffer = 4096
-)
-
 // keepAlive detects dead peers on idle sockets: after 15s idle, 9 probes 15s apart, so about 150s
 // to drop a half-open connection. smux keepalive usually fires first for the tunnel itself; this
 // covers target sockets, which have no smux.

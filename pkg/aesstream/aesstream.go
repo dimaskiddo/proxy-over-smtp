@@ -13,8 +13,11 @@ import (
 )
 
 // maxRecord caps the plaintext sealed into one record. It bounds the transient ciphertext buffer
-// to a size the relay's 32KB copy buffer covers in two records.
+// to a size the relay's copy buffer covers in a whole number of records.
 const maxRecord = 16 << 10
+
+// hdrLen is the big-endian record length prefix that precedes every sealed record.
+const hdrLen = 4
 
 // Errors returned by Read when a peer's records cannot be processed.
 var (
@@ -111,7 +114,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 
 	// The header is a local, not a field: Read and Write hold different mutexes and would
 	// otherwise clobber a shared buffer.
-	var hdr [4]byte
+	var hdr [hdrLen]byte
 
 	if _, err := io.ReadFull(s.inner, hdr[:]); err != nil {
 		if errors.Is(err, io.EOF) {
@@ -176,23 +179,20 @@ func (s *Stream) Write(p []byte) (int, error) {
 }
 
 // writeRecord seals one chunk of at most maxRecord bytes and writes its length prefix followed by
-// the ciphertext. The counter advances only once both parts are on the wire, so it always equals
-// the number of records the peer can have seen.
+// the ciphertext in a single write. The counter advances only once the bytes are on the wire, so it
+// always equals the number of records the peer can have seen.
 func (s *Stream) writeRecord(p []byte) error {
-	if cap(s.cbuf) < len(p)+s.seal.Overhead() {
-		s.cbuf = make([]byte, len(p)+s.seal.Overhead())
+	need := hdrLen + len(p) + s.seal.Overhead()
+	if cap(s.cbuf) < need {
+		s.cbuf = make([]byte, need)
 	}
 
-	rec := s.seal.Seal(s.cbuf[:0], setNonce(s.wnb, s.wseq), p, nil)
+	// One buffer holds the length prefix and the sealed record, so a record costs one syscall
+	// instead of two with the header and the ciphertext separate.
+	rec := s.seal.Seal(s.cbuf[hdrLen:hdrLen], setNonce(s.wnb, s.wseq), p, nil)
+	binary.BigEndian.PutUint32(s.cbuf[:hdrLen], uint32(len(rec)))
 
-	var hdr [4]byte
-	binary.BigEndian.PutUint32(hdr[:], uint32(len(rec)))
-
-	if err := writeFull(s.inner, hdr[:]); err != nil {
-		return err
-	}
-
-	if err := writeFull(s.inner, rec); err != nil {
+	if err := writeFull(s.inner, s.cbuf[:hdrLen+len(rec)]); err != nil {
 		return err
 	}
 

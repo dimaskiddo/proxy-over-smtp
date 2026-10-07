@@ -44,6 +44,15 @@ run:
 	make vendor
 	go run ./cmd/proxy-over-smtp $(ARGS)
 
+test:
+	go test -count=1 ./...
+
+bench:
+	CGO_ENABLED=0 go test -run xxx -bench . -benchtime 10s ./pkg/relay/ ./pkg/aesstream/ ./pkg/xorstream/ ./internal/tunnel/
+
+bench-short:
+	CGO_ENABLED=0 go test -run xxx -bench . -benchtime 1s ./pkg/relay/ ./pkg/aesstream/ ./pkg/xorstream/ ./internal/tunnel/
+
 clean-dist:
 	rm -rf dist
 

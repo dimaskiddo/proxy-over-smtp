@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -115,7 +116,7 @@ type pair struct {
 
 // newPair runs a real server accept loop and a client accept loop over loopback. Cleanup stops
 // both and drains them.
-func newPair(t *testing.T, cliCfg config.Config) *pair {
+func newPair(t testing.TB, cliCfg config.Config) *pair {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
@@ -187,7 +188,7 @@ func startPair(t *testing.T) *Tunnel {
 }
 
 // socksConnect opens a tunnel stream and runs the SOCKS5 CONNECT exchange to target.
-func socksConnect(t *testing.T, cli *Tunnel, target net.Addr) io.ReadWriteCloser {
+func socksConnect(t testing.TB, cli *Tunnel, target net.Addr) io.ReadWriteCloser {
 	t.Helper()
 
 	s, err := cli.openStream(context.Background())
@@ -217,7 +218,7 @@ func socksConnect(t *testing.T, cli *Tunnel, target net.Addr) io.ReadWriteCloser
 }
 
 // echoListener returns a loopback listener that echoes every connection until the test ends.
-func echoListener(t *testing.T) net.Listener {
+func echoListener(t testing.TB) net.Listener {
 	t.Helper()
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -277,6 +278,63 @@ func TestTunnelStreams(t *testing.T) {
 
 			wg.Wait()
 		})
+	}
+}
+
+// BenchmarkProxyThroughput pumps bytes through a real client and server pair over loopback and
+// drains them back through an echo target. stream counts concurrent proxied connections, which is
+// how a link above one stream's window/RTT ceiling is meant to be driven. Numbers are
+// informational, not a gate.
+func BenchmarkProxyThroughput(b *testing.B) {
+	for _, cipher := range []string{config.CipherAES, config.CipherXOR} {
+		for _, streams := range []int{1, 8} {
+			b.Run(fmt.Sprintf("%s/%dstreams", cipher, streams), func(b *testing.B) {
+				cli := newPair(b, config.Config{Cipher: cipher}).cli
+				echo := echoListener(b)
+
+				// Sized so one round is one relay buffer; each stream reads its own echo back, so a
+				// paused reader cannot stall the session.
+				payload := make([]byte, 128*1024)
+				total := int64(len(payload)) * int64(streams)
+
+				conns := make([]io.ReadWriteCloser, streams)
+				for i := range conns {
+					conns[i] = socksConnect(b, cli, echo.Addr())
+				}
+
+				b.Cleanup(func() {
+					for _, c := range conns {
+						c.Close()
+					}
+				})
+
+				b.SetBytes(total)
+				b.ResetTimer()
+
+				for i := 0; i < b.N; i++ {
+					var wg sync.WaitGroup
+
+					for _, c := range conns {
+						wg.Add(1)
+
+						go func(c io.ReadWriteCloser) {
+							defer wg.Done()
+
+							if _, err := c.Write(payload); err != nil {
+								b.Error(err)
+								return
+							}
+
+							if _, err := io.ReadFull(c, payload); err != nil {
+								b.Error(err)
+							}
+						}(c)
+					}
+
+					wg.Wait()
+				}
+			})
+		}
 	}
 }
 

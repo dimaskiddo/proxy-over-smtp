@@ -4,6 +4,7 @@ package tunnel
 
 import (
 	"context"
+	"io"
 	"net"
 	"testing"
 
@@ -37,8 +38,14 @@ func sockInt(t *testing.T, c net.Conn, level, opt int) int {
 	return v
 }
 
-// TestSocketOptions checks that both ends of a connection carry the tuned options. Linux reports
-// double the requested buffer, so buffers are asserted as a range, not an exact value.
+// minSockBuffer is the floor a kernel-tuned send or receive buffer must clear. Every supported
+// platform autotunes well past this, so a value below it means a fixed small buffer was set and
+// throughput is capped near buffer/RTT.
+const minSockBuffer = 64 * 1024
+
+// TestSocketOptions checks that both ends of a connection carry the tuned options. Send and
+// receive buffers must stay under kernel control: a small fixed buffer caps bulk throughput, so
+// they are asserted to grow past minSockBuffer instead of matching an exact size.
 func TestSocketOptions(t *testing.T) {
 	tn := &Tunnel{cfg: config.Config{Listen: "127.0.0.1:0"}}
 
@@ -71,13 +78,25 @@ func TestSocketOptions(t *testing.T) {
 	}
 	defer srv.Close()
 
+	// A burst gives kernel buffer autotuning a reason to grow both sockets.
+	blob := make([]byte, 512*1024)
+	go func() {
+		if _, err := srv.Write(blob); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	if _, err := io.CopyN(io.Discard, cli, int64(len(blob))); err != nil {
+		t.Fatal(err)
+	}
+
 	tests := []struct {
 		name       string
 		level, opt int
 		min, max   int
 	}{
-		{"SO_RCVBUF", unix.SOL_SOCKET, unix.SO_RCVBUF, sockBuffer, 4 * sockBuffer},
-		{"SO_SNDBUF", unix.SOL_SOCKET, unix.SO_SNDBUF, sockBuffer, 4 * sockBuffer},
+		{"SO_RCVBUF", unix.SOL_SOCKET, unix.SO_RCVBUF, minSockBuffer, 1 << 30},
+		{"SO_SNDBUF", unix.SOL_SOCKET, unix.SO_SNDBUF, minSockBuffer, 1 << 30},
 		{"TCP_NODELAY", unix.IPPROTO_TCP, unix.TCP_NODELAY, 1, 1},
 		{"SO_KEEPALIVE", unix.SOL_SOCKET, unix.SO_KEEPALIVE, 1, 1},
 	}

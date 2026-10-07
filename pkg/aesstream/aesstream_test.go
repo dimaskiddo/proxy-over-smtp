@@ -4,13 +4,49 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
 )
 
+// discardRW is an io.ReadWriter that swallows writes and never yields a byte, so seal cost can be
+// measured without a network or a buffer.
+type discardRW struct{}
+
+// Write discards p.
+func (discardRW) Write(p []byte) (int, error) { return len(p), nil }
+
+// Read reports EOF.
+func (discardRW) Read([]byte) (int, error) { return 0, io.EOF }
+
+// BenchmarkWrite measures seal cost with one record per 128KB write, which is what the relay
+// hands it. Informational, not a gate.
+func BenchmarkWrite(b *testing.B) {
+	c2s, s2c := keys(b)
+
+	payload := make([]byte, 128*1024)
+	if _, err := rand.Read(payload); err != nil {
+		b.Fatal(err)
+	}
+
+	s, err := New(discardRW{}, c2s, s2c)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := s.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // keys returns two distinct 32-byte key pairs for the two directions.
-func keys(t *testing.T) (c2s, s2c []byte) {
+func keys(t testing.TB) (c2s, s2c []byte) {
 	t.Helper()
 
 	c2s = make([]byte, 32)
@@ -67,6 +103,57 @@ func TestRoundTrip(t *testing.T) {
 
 	if !bytes.Equal(got, msg) {
 		t.Fatalf("got %d bytes want %d", len(got), len(msg))
+	}
+}
+
+// TestRecordBoundaries writes each size in one call and reads it back one byte at a time, so a
+// coalesced header and body must still split correctly across record boundaries.
+func TestRecordBoundaries(t *testing.T) {
+	sizes := []int{0, 1, maxRecord - 1, maxRecord, maxRecord + 1, 1 << 20}
+
+	for _, size := range sizes {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			c2s, s2c := keys(t)
+
+			var wire bytes.Buffer
+			w, err := New(&wire, c2s, s2c)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			msg := make([]byte, size)
+			if _, err := rand.Read(msg); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := w.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+
+			// An empty write stays a no-op even after records are already on the wire.
+			if n, err := w.Write(nil); n != 0 || err != nil {
+				t.Fatalf("empty write = %d, %v", n, err)
+			}
+
+			r, err := New(&wire, s2c, c2s)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got := make([]byte, 0, size)
+			buf := make([]byte, 1)
+			for len(got) < size {
+				n, err := r.Read(buf)
+				got = append(got, buf[:n]...)
+				if err != nil {
+					t.Fatalf("read %d of %d: %v", len(got), size, err)
+				}
+			}
+
+			if !bytes.Equal(got, msg) {
+				t.Fatalf("payload corrupted at size %d", size)
+			}
+		})
 	}
 }
 

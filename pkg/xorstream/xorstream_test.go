@@ -2,8 +2,39 @@ package xorstream
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
+
+// discardRW swallows writes and never yields a byte, so key cost can be measured without a
+// network or a buffer.
+type discardRW struct{}
+
+// Write discards p.
+func (discardRW) Write(p []byte) (int, error) { return len(p), nil }
+
+// Read reports EOF.
+func (discardRW) Read([]byte) (int, error) { return 0, io.EOF }
+
+// BenchmarkWrite measures the rolling-XOR seal cost at the relay's chunk size. Informational,
+// not a gate.
+func BenchmarkWrite(b *testing.B) {
+	payload := make([]byte, 128*1024)
+
+	w, err := New(discardRW{}, "benchsecret")
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := w.Write(payload); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
 
 func TestRoundTrip(t *testing.T) {
 	var wire bytes.Buffer

@@ -145,6 +145,23 @@ TCP
 | `KeepAliveInterval` | 15s |
 | `KeepAliveTimeout` | 60s |
 
+### Throughput
+
+A single smux stream can never exceed `window / RTT`, with the window fixed at `MaxStreamBuffer` = 512KB. That is a property of any sliding-window transport, not of this code, and it is why one stream over a WAN link underruns no matter how fast the CPU is:
+
+| RTT | One stream |
+|---|---|
+| 1 ms | ~4 Gbps |
+| 20 ms | ~205 Mbps |
+| 50 ms | ~82 Mbps |
+| 100 ms | ~41 Mbps |
+
+A session aggregates its streams, bounded by `MaxReceiveBuffer` = 16MB, so one client reaches `16MB / RTT` once enough streams are open: 800 Mbps needs 4 streams at 20ms RTT, 10 at 50ms and 20 at 100ms, all under the `--max-streams` default of 128. Above ~100ms RTT a single session cannot hold 800 Mbps at all.
+
+What is left after the window is CPU: measured same-host at ~139 MB/s for AES and ~133 MB/s for XOR, with an aggregate ceiling near 161 MB/s. A live CPU profile of a 3GiB transfer shows `Syscall6` 55% and `futex` 14% against 6% in GCM, so the limit is syscalls and goroutine scheduling, not the cipher. Both ciphers land in the same place end to end: AES has hardware GCM, and XOR's key application is cheap, but neither dominates the syscall cost. A faster host raises the CPU ceiling; the `window / RTT` ceiling moves only with RTT.
+
+The socket buffers stay under kernel autotuning for the same reason: a fixed buffer would cap a single flow no matter how many streams are open. See [Socket options](#5-socket-options). `make bench` reports the per-layer numbers above; the guarantee is documented, not enforced by a CI gate, because shared runners are too noisy to assert throughput on.
+
 ---
 
 ## 4. Proxy Protocols
@@ -203,11 +220,10 @@ A SOCKS5 request that is truncated or malformed is answered with a reply before 
 
 ## 5. Socket options
 
-Implemented in `internal/tunnel/socket*.go`. Fixed in code: no flags, no env vars. They apply to all four TCP sockets: server listener, server-to-target dial, client listener and client-to-server dial. Accepted connections inherit buffer sizes from the listener. Options are set in the `Control` hook, after `socket()` and before `bind()` or `connect()`, so they take effect for window scaling. A failed `setsockopt` fails the listen or dial. The target ACL runs before them on server dials.
+Implemented in `internal/tunnel/socket*.go`. Fixed in code: no flags, no env vars. They apply to all four TCP sockets: server listener, server-to-target dial, client listener and client-to-server dial. Options are set in the `Control` hook, after `socket()` and before `bind()` or `connect()`, so they take effect for window scaling. A failed `setsockopt` fails the listen or dial. The target ACL runs before them on server dials.
 
 | Option | Value | Sockets | OS |
 |---|---|---|---|
-| `SO_RCVBUF`, `SO_SNDBUF` | 4096 | all | all |
 | `TCP_NODELAY` | on | all | all |
 | TCP keepalive | idle 15s, interval 15s, 9 probes | all | all |
 | `SO_REUSEADDR` | on | listeners | Unix only |
@@ -215,7 +231,7 @@ Implemented in `internal/tunnel/socket*.go`. Fixed in code: no flags, no env var
 
 Consequences:
 
-- A fixed buffer turns off kernel autotuning. All streams share one tunnel connection, so throughput is capped near buffer/RTT: about 80KB/s at 50ms RTT. Linux stores double the value (`ss` shows `rb8192`) and window scaling stays off (`wscale 0`). To change it, edit `sockBuffer` in `socket.go`.
+- Send and receive buffers are **not** set: the kernel autotunes them. A fixed small buffer caps throughput near buffer/RTT (4KB at 50ms RTT is about 80KB/s) and turns window scaling off, so leaving them alone is what keeps bulk transfers fast. Per-connection throughput is bounded by smux framing and the cipher, not by a socket buffer.
 - `SO_REUSEPORT` lets a new binary bind the port while the old one drains (zero-downtime restart). It also means a second server accidentally started on the same port succeeds, and the kernel splits connections between both processes.
 - Windows has no `SO_REUSEPORT`, and its `SO_REUSEADDR` lets another process take a bound port, so neither is set there.
 - Keepalive also covers target sockets, which have no smux keepalive.
@@ -224,7 +240,7 @@ Consequences:
 
 ## 6. Relay (`pkg/relay/relay.go`)
 
-Two `io.CopyBuffer` goroutines (one per direction) with 32KB buffers from a `sync.Pool`. The reader and writer are wrapped so `WriterTo`/`ReaderFrom` fast paths cannot bypass the pool. When the first direction ends, `Pipe` closes both ends and returns only after both copies have exited.
+Two `io.CopyBuffer` goroutines (one per direction) with 128KB buffers from a `sync.Pool`. The reader and writer are wrapped so `WriterTo`/`ReaderFrom` fast paths cannot bypass the pool. When the first direction ends, `Pipe` closes both ends and returns only after both copies have exited.
 
 ---
 
@@ -305,6 +321,8 @@ Auto-update restart takes the same path before re-exec.
 11. **Self-update from stdlib** — no update library; `net/http`, `archive/zip` and `crypto/sha256` cover it. Auto-update is opt-in because it can split server and client versions.
 12. **One HTTP request per connection** — plain HTTP forwarding sets `Connection: close` and strips hop-by-hop headers. Keep-alive across different hosts would need a request loop; modern clients use `CONNECT` for HTTPS, which is a raw relay.
 13. **Drain before close** — listeners stop first and connections finish on their own, bounded by `--drain-timeout`. A second signal forces. Container and orchestrator grace periods must exceed the drain timeout.
-14. **Socket options fixed in code** — buffers, `TCP_NODELAY`, keepalive and reuse flags are constants, not settings: one tested profile, no per-deployment tuning to get wrong. Cost: no runtime override of the 4096 buffers. See [Socket options](#5-socket-options).
+14. **Socket options fixed in code** — `TCP_NODELAY`, keepalive and reuse flags are constants, not settings: one tested profile, no per-deployment tuning to get wrong. Send and receive buffers are left to the kernel, which autotunes them better than any fixed value. See [Socket options](#5-socket-options).
 15. **Doc comments** — Google Go style: a package comment per package, a doc comment starting with the name on every exported and non-trivial unexported symbol, bodies comment only the why.
 16. **Challenge-response handshake, stdlib crypto** — a per-connection nonce plus `HMAC-SHA256` proves the secret without sending it, and derives directional keys (`crypto/hmac`, `crypto/sha256`; no new dependency). The handshake still looks like `220`/`EHLO`/`DATA`. Cost: it is a wire break, so old and new binaries do not interoperate.
+17. **80% line rate to 1 Gbps, scoped to multiple streams** — the ceiling of one stream is `window / RTT`, and widening the 512KB window is a wire break for a gain the default 128-stream cap already covers. So the guarantee is stated per stream count and per RTT instead of as one per-connection number. Cost: a single long-fat connection underruns, and callers that open only one stream need to know that. See [Throughput](#throughput).
+18. **Benchmarks are informational** — `BenchmarkPipe`, `BenchmarkWrite` and `BenchmarkProxyThroughput` report numbers and never fail on speed, because a shared runner cannot give a stable threshold. Correctness stays covered by the ordinary tests, which is where a regression would show up first.

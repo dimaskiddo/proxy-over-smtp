@@ -32,7 +32,7 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 *   **🔐 Selectable Cipher:** `--cipher aes` (default) wraps the tunnel in AES-256-GCM records for confidentiality and integrity; `--cipher xor` keeps a fast rolling-key XOR for obfuscation only.
 *   **🤝 Challenge-Response Handshake:** The server sends a fresh nonce and the client answers with an HMAC of the secret. The secret is never sent on the wire, and both stream keys are derived from it per connection.
 *   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
-*   **🔧 Tuned Sockets:** Every socket gets fixed kernel options in code: 4096-byte send and receive buffers, `TCP_NODELAY`, TCP keepalive, and `SO_REUSEADDR` / `SO_REUSEPORT` on Unix listeners. Nothing to configure. The small buffers suit many small flows, not bulk transfer: see [Socket options](docs/ARCHITECTURE.md#5-socket-options).
+*   **🔧 Tuned Sockets:** `TCP_NODELAY`, TCP keepalive, and `SO_REUSEADDR` / `SO_REUSEPORT` on Unix listeners are set in code, and send/receive buffers stay under kernel autotuning so bulk transfers are not capped by a fixed buffer/RTT limit. Nothing to configure: see [Socket options](docs/ARCHITECTURE.md#5-socket-options).
 *   **🧦 Many Proxy Protocols, One Port:** SOCKS4/4a, SOCKS5, HTTP (plain and `CONNECT`) and HTTPS (TLS proxy listener) are auto-detected from the first byte. Works with browsers, `curl`, `git`, `apt` and anything that honors `http_proxy` / `https_proxy` or SOCKS.
 *   **🛑 Graceful Shutdown:** On `SIGINT` / `SIGTERM` the listener stops and active connections drain until done or `--drain-timeout` (default 30s). A second signal forces exit.
 *   **📝 Structured Logs:** `slog` events on stdout (text or JSON), one `tunnel opened` line per proxied connection. Optional log file.
@@ -232,6 +232,42 @@ time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" target=10
 ```
 
 `--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged; the target host and port are, as the audit trail, so treat the log stream as sensitive when it leaves the host.
+
+---
+
+## 📈 Performance
+
+The tunnel is built to hold **80% of line rate up to 1 Gbps**, with one caveat that follows from how TCP multiplexing works: **one stream cannot fill a high-latency link**. Each smux stream carries a fixed 512KB window, so a single stream tops out near `window / RTT`. A WAN link needs **several concurrent connections** (browsers already open many) to reach line rate.
+
+Per-stream ceiling at the fixed 512KB window (`window / RTT`):
+
+| RTT | One stream | Streams for 800 Mbps (100 MB/s) |
+|---|---|---|
+| 1 ms (LAN) | ~4 Gbps | 1 |
+| 20 ms | ~205 Mbps | 4 |
+| 50 ms | ~82 Mbps | 10 |
+| 100 ms | ~41 Mbps | 20 |
+
+All counts sit well under the `--max-streams` default of 128, and the session-wide 16MB receive buffer clears 800 Mbps up to ~100 ms RTT once the streams are open.
+
+Measured on a Ryzen 5 PRO 4650U, 200MB transfer through the client on one host:
+
+| Path | Throughput |
+|---|---|
+| Tunnel, `--cipher aes`, 1 stream | ~139 MB/s (~1.1 Gbps) |
+| Tunnel, `--cipher xor`, 1 stream | ~133 MB/s |
+| Tunnel ceiling, aggregate | ~161 MB/s (~1.3 Gbps) |
+
+Both ciphers land in the same place end to end: AES has hardware GCM, and XOR's read path is zero-copy, so the cost is dominated by syscalls and scheduling rather than crypto. `--cipher aes` stays the default.
+
+**Checking it yourself.** `curl` can cap a transfer, so the cap, not the proxy, sets the target. Direct and proxied runs at the same cap should agree:
+
+```sh
+curl -o /dev/null --limit-rate 100M http://host/file                          # direct
+curl -o /dev/null --limit-rate 100M -x socks5h://127.0.0.1:1080 http://host/file
+```
+
+Measured that way on the same host: 99.8% (`aes`) and 99.7% (`xor`) at a 100M cap, 99.1% at 50M. At a 200M cap the absolute rate is ~136 MB/s, about 67% — past 1 Gbps the CPU ceiling is the limit, which is expected. `iperf3 -c host` through the client works too, and `iperf3 -P 8` shows the multi-stream behaviour. `make bench` prints the per-layer numbers above.
 
 ---
 

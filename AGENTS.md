@@ -29,11 +29,11 @@ SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with a sele
 | **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `assetName` mirrors `.goreleaser.yml` archive names |
-| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session (one dial at a time), SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial, per-session stream cap (`--max-streams`, default 128). Handshake lines capped at 4KB. `Shutdown(ctx)` drains; `spawn` and `Shutdown` share a lock so no handler starts mid-drain, and `RunServer`/`RunClient` after `Shutdown` return an error. `handshake.go`: challenge-response + key derivation + capped line reads. `cipher.go`: XOR/AES stream selection. `mux.go`: smux config. `socket*.go`: fixed socket options (buffers, reuse, keepalive), per-OS |
+| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session (one dial at a time), SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial, per-session stream cap (`--max-streams`, default 128). Handshake lines capped at 4KB. `Shutdown(ctx)` drains; `spawn` and `Shutdown` share a lock so no handler starts mid-drain, and `RunServer`/`RunClient` after `Shutdown` return an error. `handshake.go`: challenge-response + key derivation + capped line reads. `cipher.go`: XOR/AES stream selection. `mux.go`: smux config. `socket*.go`: fixed socket options (TCP_NODELAY, reuse, keepalive; send/receive buffers left to kernel autotuning), per-OS |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
 | **SOCKS4** | `pkg/socks4/` — SOCKS4/4a request parser and reply writer (CONNECT only) |
 | **HTTP proxy** | `pkg/httpproxy/` — CONNECT and absolute-form parser, status writer, forwarder |
-| **Relay** | `pkg/relay/` — bidirectional copy with pooled 32KB buffers |
+| **Relay** | `pkg/relay/` — bidirectional copy with pooled 128KB buffers |
 | **XOR Stream** | `pkg/xorstream/` — rolling-key XOR `io.ReadWriter` wrapper (obfuscation only) |
 | **AES Stream** | `pkg/aesstream/` — AES-256-GCM record `io.ReadWriter` wrapper (confidentiality and integrity) |
 
@@ -86,6 +86,12 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 
 ### Tests
 - Stdlib `testing`, table-driven, `_test.go` next to code. `net.Pipe` for protocol tests.
+
+### Performance
+- Target: 80% of line rate up to 1 Gbps, **scoped to multiple streams**. One smux stream is capped at `window / RTT` (512KB window), so never quote a single-connection number for a high-RTT link. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#throughput).
+- Benchmarks (`BenchmarkPipe`, `BenchmarkWrite`, `BenchmarkProxyThroughput`, run via `make bench`) report numbers and never assert a rate. No CI perf gate.
+- Send and receive buffers stay under kernel autotuning. Do not set `SO_SNDBUF` / `SO_RCVBUF`: a fixed value caps a flow near buffer/RTT.
+- Widening the smux session or stream buffers is a wire break, so it needs a joint client+server rollout.
 
 ---
 
@@ -148,7 +154,7 @@ proxy-over-smtp/
 | `docs/ARCHITECTURE.md` | Module map, handshake, transport stack, design decisions |
 | `docs/WORKFLOWS.md` | Pipeline flows, error recovery |
 | `TASKS.md` | Current project state — internal, not in repo |
-| `Makefile` | Build targets |
+| `Makefile` | Build targets (`build`, `run`, `test`, `bench`, `bench-short`) |
 | `.goreleaser.yml` | Release config (darwin/linux/windows × 386/amd64/arm64) |
 | `internal/tunnel/` | Client and server implementation |
 | `pkg/` | Reusable SOCKS4/5, HTTP proxy, relay, XOR and AES streams |

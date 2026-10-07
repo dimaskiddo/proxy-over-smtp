@@ -14,10 +14,9 @@ func setsockopt(fd uintptr, level, opt, val int) error {
 }
 
 // Windows has no SO_REUSEPORT, and its SO_REUSEADDR lets another process steal a bound port, so
-// neither is set. Go keeps its own safe listener default there.
+// neither is set. Go keeps its own safe listener default there. Send and receive buffers are left
+// to kernel autotuning: a fixed small buffer caps throughput at roughly buffer/RTT.
 var opts = []sockOpt{
-	{"SO_RCVBUF", windows.SOL_SOCKET, windows.SO_RCVBUF, sockBuffer},
-	{"SO_SNDBUF", windows.SOL_SOCKET, windows.SO_SNDBUF, sockBuffer},
 	{"TCP_NODELAY", windows.IPPROTO_TCP, windows.TCP_NODELAY, 1},
 }
 

@@ -6,8 +6,9 @@ import (
 	"sync"
 )
 
-// bufferSize is the size of each pooled copy buffer.
-const bufferSize = 32 * 1024
+// bufferSize is the size of each pooled copy buffer. Large enough that a bulk transfer spends its
+// time in the kernel rather than in per-copy syscalls.
+const bufferSize = 128 * 1024
 
 // bufferPool recycles copy buffers so busy proxies do not allocate per connection.
 var bufferPool = sync.Pool{
