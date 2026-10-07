@@ -13,7 +13,8 @@ type BuildInfo struct {
 	Date    string
 }
 
-func (b BuildInfo) String() string {
+// resolved falls back to the module build info when the linker injected no version.
+func (b BuildInfo) resolved() (version, commit string) {
 	v, c := b.Version, b.Commit
 
 	if v == "dev" {
@@ -29,6 +30,12 @@ func (b BuildInfo) String() string {
 			}
 		}
 	}
+
+	return v, c
+}
+
+func (b BuildInfo) String() string {
+	v, c := b.resolved()
 
 	return fmt.Sprintf("Proxy-Over-SMTP %s (commit %s, built %s, %s %s/%s)",
 		v, c, b.Date, runtime.Version(), runtime.GOOS, runtime.GOARCH)

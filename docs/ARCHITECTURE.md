@@ -16,6 +16,7 @@ graph LR
         Cli["cli/<br/>root.go env.go log.go<br/>server.go client.go version.go"]
         Config["config/"]
         Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go mux.go"]
+        Update["update/<br/>update.go replace.go<br/>restart_*.go"]
     end
 
     subgraph pkg["pkg/"]
@@ -28,6 +29,8 @@ graph LR
     Cobra["spf13/cobra"]
 
     Main --> Cli
+    Main --> Update
+    Cli --> Update
     Cli --> Config
     Cli --> Tunnel
     Tunnel --> Config
@@ -64,10 +67,11 @@ sequenceDiagram
 | Component | Package | Role |
 |---|---|---|
 | **Entry** | `cmd/proxy-over-smtp/` | Signal context, build info (ldflags), call `cli.Execute` |
-| **CLI** | `internal/cli/` | Cobra commands (`server`, `client`, `version`), env-to-flag fallback, `slog` logger, graceful drain |
+| **CLI** | `internal/cli/` | Cobra commands (`server`, `client`, `version`, `update`), env-to-flag fallback, `slog` logger, graceful drain |
 | **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, connection `WaitGroup`, shared client session |
 | **Client** | `internal/tunnel/client.go` | Local listener. Does **not** parse SOCKS: pipes raw local bytes into a new smux stream. Browser SOCKS5 handshake is therefore answered by the server |
 | **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream SOCKS5 + dial + relay |
+| **Update** | `internal/update/` | Release lookup, verified download, self-replace, re-exec |
 | **Mux** | `internal/tunnel/mux.go` | Shared smux config for both sides |
 | **SOCKS5** | `pkg/socks5/` | Server-side negotiation, returns `host:port` |
 | **Relay** | `pkg/relay/` | Bidirectional copy |
@@ -138,7 +142,7 @@ Two `io.CopyBuffer` goroutines (one per direction) with 32KB buffers from a `syn
 
 ## 6. Configuration & Logging (`internal/cli/`, `internal/config/config.go`)
 
-Commands: `proxy-over-smtp server`, `proxy-over-smtp client`, `proxy-over-smtp version` (also `--version`).
+Commands: `proxy-over-smtp server`, `proxy-over-smtp client`, `proxy-over-smtp update [--check] [--force]`, `proxy-over-smtp version` (also `--version`).
 
 Precedence: command-line flag, then environment variable, then default. The env name is `PROXY_OVER_SMTP_` plus the flag name uppercased with `-` as `_`. `--help` shows each name.
 
@@ -151,6 +155,8 @@ Precedence: command-line flag, then environment variable, then default. The env 
 | `--log-level` | `PROXY_OVER_SMTP_LOG_LEVEL` | `info` | all | `debug`, `info`, `warn`, `error` |
 | `--log-format` | `PROXY_OVER_SMTP_LOG_FORMAT` | `text` | all | `text` or `json` |
 | `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file. Stdout only when empty |
+| `--auto-update` | `PROXY_OVER_SMTP_AUTO_UPDATE` | `false` | server, client | Periodic release check, swap and re-exec |
+| `--update-interval` | `PROXY_OVER_SMTP_UPDATE_INTERVAL` | `24h` | server, client | Check interval, minimum `1h` |
 
 Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`), `target unreachable` (warn), `shutdown complete`. Handshake and SOCKS rejections log at debug. The secret is never logged.
 
@@ -166,6 +172,18 @@ Logging: `log/slog` with structured key/value fields, written to stdout as an ev
 
 ---
 
+## 7a. Self-update (`internal/update/`)
+
+1. `Latest` reads the GitHub `releases/latest` JSON (`tag_name`, asset names and URLs). Hidden `--update-api` overrides the endpoint for tests and mirrors.
+2. `assetName` maps GOOS/GOARCH to the GoReleaser archive name `proxy-over-smtp_<ver>_<os>_<arch>.zip` (darwin→macos, 386→32-bit, amd64→64-bit, arm64→arm-64-bit). It is coupled to `.goreleaser.yml`: rename one, rename the other.
+3. `Apply` downloads the zip and `checksums.txt` (100MB cap each), requires a sha256 match, extracts the binary in memory.
+4. `replace` writes a temp file beside the executable with the original mode, fsyncs, then renames over it (atomic on POSIX). On Windows the running exe is first renamed to `<exe>.old`, removed best-effort on the next update.
+5. Auto-update (in `internal/cli/update.go`) sets `app.restart` and cancels the run context, so the normal drain runs. `main` then calls `update.Restart()`: `syscall.Exec` on Unix (same PID), a child process plus exit on Windows.
+
+`Newer` compares `X.Y.Z` only and ignores any `-pre`/`+meta` suffix. `dev` builds never auto-update and need `--force` for manual update. The checksum comes from the same release as the archive, so it proves integrity, not authenticity: there is no signing.
+
+---
+
 ## 8. Key Design Decisions
 
 1. **Fake SMTP handshake** — first bytes look like a mail session to naive DPI.
@@ -178,3 +196,4 @@ Logging: `log/slog` with structured key/value fields, written to stdout as an ev
 8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64). Version, commit and date are injected via ldflags.
 9. **Twelve-factor** — config only from flags and env (no default secret), logs as a stdout event stream, stateless processes, port binding via `--listen`, graceful SIGTERM drain, `version` as an admin command.
 10. **smux v2 per-stream windows** — with v1 one unread stream fills the shared session buffer and stalls every stream. Limitation: smux has no half-close, so a client that only shuts down its write side (e.g. `nc -N`) loses the response.
+11. **Self-update from stdlib** — no update library; `net/http`, `archive/zip` and `crypto/sha256` cover it. Auto-update is opt-in because it can split server and client versions.

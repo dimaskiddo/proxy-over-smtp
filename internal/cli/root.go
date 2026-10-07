@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -17,20 +18,31 @@ import (
 const drainTimeout = 5 * time.Second
 
 type app struct {
-	out    io.Writer
-	log    *slog.Logger
-	closer io.Closer
+	out     io.Writer
+	log     *slog.Logger
+	closer  io.Closer
+	info    BuildInfo
+	restart atomic.Bool
 
 	logLevel, logFormat, logFile string
 }
 
-// Execute runs the command tree. Cobra prints the returned error.
-func Execute(ctx context.Context, info BuildInfo) error {
-	return newRoot(info, os.Stdout).ExecuteContext(ctx)
+// Execute runs the command tree. Cobra prints the returned error. restart is true when an
+// auto-update installed a new binary and the caller should re-exec it.
+func Execute(ctx context.Context, info BuildInfo) (restart bool, err error) {
+	root, a := newApp(info, os.Stdout)
+	err = root.ExecuteContext(ctx)
+
+	return err == nil && a.restart.Load(), err
 }
 
 func newRoot(info BuildInfo, out io.Writer) *cobra.Command {
-	a := &app{out: out}
+	root, _ := newApp(info, out)
+	return root
+}
+
+func newApp(info BuildInfo, out io.Writer) (*cobra.Command, *app) {
+	a := &app{out: out, info: info}
 
 	root := &cobra.Command{
 		Use:           "proxy-over-smtp",
@@ -64,10 +76,10 @@ func newRoot(info BuildInfo, out io.Writer) *cobra.Command {
 	pf.StringVar(&a.logFormat, "log-format", "text", "Log format: text or json")
 	pf.StringVar(&a.logFile, "log-file", "", "Also write logs to this file (stdout only when empty)")
 
-	root.AddCommand(newServer(a), newClient(a), newVersion(info))
+	root.AddCommand(newServer(a), newClient(a), newVersion(info), newUpdate(info))
 	annotateEnv(root)
 
-	return root
+	return root, a
 }
 
 func newVersion(info BuildInfo) *cobra.Command {
@@ -82,7 +94,10 @@ func newVersion(info BuildInfo) *cobra.Command {
 }
 
 func newServer(a *app) *cobra.Command {
-	var cfg config.Config
+	var (
+		cfg config.Config
+		upd updateOpts
+	)
 
 	cmd := &cobra.Command{
 		Use:   "server",
@@ -93,8 +108,12 @@ func newServer(a *app) *cobra.Command {
 				return err
 			}
 
+			if err := upd.validate(); err != nil {
+				return err
+			}
+
 			t := tunnel.New(cfg, a.log)
-			return a.run(cmd.Context(), t, t.RunServer)
+			return a.run(cmd.Context(), t, upd, t.RunServer)
 		},
 	}
 
@@ -102,12 +121,16 @@ func newServer(a *app) *cobra.Command {
 	f.StringVar(&cfg.Listen, "listen", "0.0.0.0:465", "Server listen address")
 	f.StringVar(&cfg.Secret, "secret", "", "Shared secret: EHLO token and XOR key (prefer the env var)")
 	f.BoolVar(&cfg.AllowPrivate, "allow-private", false, "Allow loopback, private and link-local targets")
+	upd.bind(cmd)
 
 	return cmd
 }
 
 func newClient(a *app) *cobra.Command {
-	var cfg config.Config
+	var (
+		cfg config.Config
+		upd updateOpts
+	)
 
 	cmd := &cobra.Command{
 		Use:   "client",
@@ -122,8 +145,12 @@ func newClient(a *app) *cobra.Command {
 				return fmt.Errorf("remote address must not be empty")
 			}
 
+			if err := upd.validate(); err != nil {
+				return err
+			}
+
 			t := tunnel.New(cfg, a.log)
-			return a.run(cmd.Context(), t, t.RunClient)
+			return a.run(cmd.Context(), t, upd, t.RunClient)
 		},
 	}
 
@@ -131,13 +158,14 @@ func newClient(a *app) *cobra.Command {
 	f.StringVar(&cfg.Listen, "listen", "0.0.0.0:1080", "Client SOCKS5 listen address")
 	f.StringVar(&cfg.Remote, "remote", "127.0.0.1:465", "Server address the client dials")
 	f.StringVar(&cfg.Secret, "secret", "", "Shared secret: EHLO token and XOR key (prefer the env var)")
+	upd.bind(cmd)
 
 	return cmd
 }
 
 // run blocks in fn until ctx is cancelled, then waits for active connections up to drainTimeout.
-func (a *app) run(ctx context.Context, t *tunnel.Tunnel, fn func(context.Context) error) error {
-	if err := fn(ctx); err != nil {
+func (a *app) run(ctx context.Context, t *tunnel.Tunnel, upd updateOpts, fn func(context.Context) error) error {
+	if err := a.runWithUpdate(ctx, upd, fn); err != nil {
 		return err
 	}
 

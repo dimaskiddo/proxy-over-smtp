@@ -24,8 +24,9 @@ SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux mult
 | Component | Role |
 |---|---|
 | **Entry** | `cmd/proxy-over-smtp/` — wiring only: signal context, ldflags build info, `cli.Execute` |
-| **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`), env fallback, `slog` logger, graceful drain |
+| **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
+| **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `assetName` mirrors `.goreleaser.yml` archive names |
 | **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream SOCKS5 + dial. `mux.go`: smux config |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
 | **Relay** | `pkg/relay/` — bidirectional copy with pooled 32KB buffers |
@@ -37,6 +38,7 @@ SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux mult
 proxy-over-smtp [--log-level info] [--log-format text] [--log-file ""] <command>
   server   --listen 0.0.0.0:465  --secret S [--allow-private]
   client   --listen 0.0.0.0:1080 --remote 127.0.0.1:465 --secret S
+  update   [--check] [--force]
   version  (also --version)
 ```
 
@@ -54,6 +56,7 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 - No new package or abstraction for single-use code.
 
 ### Wire Compatibility
+- Changing archive names in `.goreleaser.yml` requires updating `assetName` in `internal/update/update.go`, or `update` breaks.
 - Handshake, XOR, or smux changes must land in client and server together. Old and new binaries do not interoperate — say so in the commit message.
 
 ### Context & Concurrency
@@ -107,7 +110,8 @@ proxy-over-smtp/
 ├── internal/
 │   ├── cli/              # Cobra commands, env fallback, slog
 │   ├── config/           # Config + Validate
-│   └── tunnel/           # Client, server, smux config
+│   ├── tunnel/           # Client, server, smux config
+│   └── update/           # Self-update: release lookup, verify, replace, re-exec
 ├── pkg/
 │   ├── relay/            # Bidirectional pipe
 │   ├── socks5/           # SOCKS5 server negotiation

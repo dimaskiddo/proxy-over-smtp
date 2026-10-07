@@ -35,6 +35,8 @@ func TestCommands(t *testing.T) {
 		{"old style flag", []string{"server", "-secret", "x"}, nil, "unknown shorthand", ""},
 		{"bad env bool", []string{"server"}, map[string]string{"PROXY_OVER_SMTP_ALLOW_PRIVATE": "x"}, "PROXY_OVER_SMTP_ALLOW_PRIVATE", ""},
 		{"bad log level", []string{"--log-level", "loud", "server", "--secret", "x"}, nil, "invalid log level", ""},
+		{"auto-update short interval", []string{"server", "--secret", "x", "--auto-update", "--update-interval", "10m"}, nil, "at least 1h0m0s", ""},
+		{"update unreachable api", []string{"update", "--check", "--update-api", "http://127.0.0.1:1/x"}, nil, "check latest release", ""},
 		{"help lists env", []string{"server", "--help"}, nil, "", "$PROXY_OVER_SMTP_SECRET"},
 	}
 
@@ -58,5 +60,17 @@ func TestCommands(t *testing.T) {
 				t.Fatalf("output %q missing %q", out, tt.wantOut)
 			}
 		})
+	}
+}
+
+func TestUpdateDevBuild(t *testing.T) {
+	var out bytes.Buffer
+	root := newRoot(BuildInfo{Version: "dev", Commit: "none", Date: "unknown"}, &out)
+	root.SetArgs([]string{"update", "--update-api", "http://127.0.0.1:1/x"})
+	root.SetErr(&out)
+
+	err := root.Execute()
+	if err == nil || !strings.Contains(err.Error(), "use --force") {
+		t.Fatalf("err = %v, want dev build refusal", err)
 	}
 }

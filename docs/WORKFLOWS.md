@@ -48,10 +48,11 @@ flowchart TD
 ### 1. Startup (`cmd/proxy-over-smtp/main.go`)
 
 1. `signal.NotifyContext` for `SIGINT` / `SIGTERM`, then `cli.Execute(ctx, BuildInfo)`.
-2. Cobra parses the subcommand (`server`, `client`, `version`) and flags.
+2. Cobra parses the subcommand (`server`, `client`, `version`, `update`) and flags.
 3. `PersistentPreRunE`: flags not set on the command line are filled from `PROXY_OVER_SMTP_*` env (flag > env > default). Then build the `slog` logger (`--log-level`, `--log-format`, optional `--log-file` tee).
 4. `RunE`: `Config.Validate()` (secret required), `tunnel.New(cfg, logger)`, then `RunServer(ctx)` or `RunClient(ctx)`.
 5. After the run returns: drain, then `PersistentPostRunE` closes the log file. Any error exits with code 1.
+6. If auto-update installed a release, `Execute` returns `restart=true`. `main` then calls `update.Restart()`.
 
 ### 2. Server (`internal/tunnel/server.go`)
 
@@ -82,7 +83,27 @@ sequenceDiagram
 3. `getSession` under `sessMu`: reuse `Tunnel.sess` if open. Otherwise dial `--remote` (30s, cancelled by shutdown), run the client handshake, wrap in XOR, `smux.Client`.
 4. Open a stream (on failure drop the session and retry once on a fresh one) and `relay.Pipe(local, stream)`. The browser's SOCKS5 bytes travel unchanged to the server.
 
-### 4. Graceful Shutdown
+### 4. Update (`internal/update/`, `internal/cli/update.go`)
+
+```mermaid
+flowchart TD
+    Trig{{"update command, or auto-update tick"}} --> Dev{dev build?}
+    Dev -- "yes, no --force" --> Refuse[refuse / auto-update disabled]
+    Dev -- no --> Latest[GET releases/latest]
+    Latest --> Newer{newer?}
+    Newer -- "no, no --force" --> Done([up to date])
+    Newer -- yes --> Dl[download zip + checksums.txt]
+    Dl --> Sum{sha256 match?}
+    Sum -- no --> Fail([error, binary untouched])
+    Sum -- yes --> Swap[write temp, rename over exe]
+    Swap --> Mode{auto-update?}
+    Mode -- no --> Msg([print: restart running instances])
+    Mode -- yes --> Cancel[cancel ctx, drain] --> Exec([re-exec same args])
+```
+
+`auto-update` checks at start, then every `--update-interval`. Failures log a warn and keep the old binary running.
+
+### 5. Graceful Shutdown
 
 1. Signal cancels the context. Listeners, open connections and the client session close.
 2. The CLI waits on `Tunnel.Wait()` in a goroutine, racing a 5s timer.
@@ -122,3 +143,8 @@ sequenceDiagram
 | Secret missing, bad env value (e.g. `PROXY_OVER_SMTP_ALLOW_PRIVATE=x`), bad `--log-level` / `--log-format` | Exit 1 at startup |
 | Old-style flag (`-secret`, `-mode`) | Exit 1, unknown shorthand flag |
 | Shutdown exceeds 5s | Logs timeout line and exits |
+| Update check fails (network, GitHub rate limit 403/429) | `update` exits 1. Auto-update warns `update check failed` and retries next interval |
+| Checksum mismatch or missing asset for this platform | Error, binary untouched. Auto-update warns `update failed` |
+| Binary location not writable | Error with permission hint, binary untouched |
+| Re-exec fails after a successful swap | `restart:` on stderr, exit 1. New binary is on disk: start it manually |
+| `--update-interval` below 1h | Exit 1 at startup |

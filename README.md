@@ -140,6 +140,7 @@ proxy-over-smtp <command> [flags]
 
   server    Run the tunnel server
   client    Run the local SOCKS5 client
+  update    Update this binary to the latest GitHub release
   version   Print version information (also --version)
 ```
 
@@ -154,12 +155,34 @@ Server and client use the same binary and the same secret. Every flag can also b
 | `--log-level` | `PROXY_OVER_SMTP_LOG_LEVEL` | `info` | all | `debug`, `info`, `warn`, `error` |
 | `--log-format` | `PROXY_OVER_SMTP_LOG_FORMAT` | `text` | all | `text` or `json` |
 | `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file |
+| `--auto-update` | `PROXY_OVER_SMTP_AUTO_UPDATE` | `false` | server, client | Check for new releases, install and restart in place |
+| `--update-interval` | `PROXY_OVER_SMTP_UPDATE_INTERVAL` | `24h` | server, client | Auto-update check interval, minimum `1h` |
 
 Quick check through the client:
 
 ```sh
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```
+
+### 🔄 Updating
+
+```sh
+proxy-over-smtp update --check   # Print current and latest version only
+proxy-over-smtp update           # Download, verify and replace this binary
+proxy-over-smtp update --force   # Reinstall even if up to date, or from a dev build
+```
+
+`update` replaces the binary on disk. Running instances keep the old code until restarted.
+
+With `--auto-update`, a running `server` or `client` checks at start and then every `--update-interval`. On a newer release it swaps the binary, drains connections and re-executes itself with the same arguments (same PID on Unix). Dev builds never auto-update.
+
+Notes:
+
+- Downloads are verified against the release `checksums.txt` (sha256). That proves integrity, not authenticity: releases are not signed.
+- Auto-update can leave server and client on different versions. If a release changes the wire protocol, old and new do not interoperate. Update the server first, then clients.
+- Docker: the swap lives in the container layer and a container restart reverts it. Pull a new image instead.
+- Windows: the re-executed process is a child, so it detaches from a service manager. Prefer manual `update` plus a restart there.
+- The binary location must be writable by the running user.
 
 ### 📁 Logs
 

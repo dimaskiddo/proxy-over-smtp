@@ -1,0 +1,215 @@
+package cli
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dimaskiddo/proxy-over-smtp/internal/update"
+)
+
+const (
+	minUpdateInterval = time.Hour
+	updateTimeout     = 2 * time.Minute
+)
+
+var errDevBuild = errors.New("dev build has no comparable version: use --force")
+
+// updateOpts holds the auto-update flags shared by server and client.
+type updateOpts struct {
+	enabled  bool
+	interval time.Duration
+	api      string
+}
+
+func (o *updateOpts) bind(cmd *cobra.Command) {
+	f := cmd.Flags()
+	f.BoolVar(&o.enabled, "auto-update", false, "Check GitHub releases periodically, install a newer one and restart")
+	f.DurationVar(&o.interval, "update-interval", 24*time.Hour, "Auto-update check interval (minimum 1h)")
+	f.StringVar(&o.api, "update-api", update.DefaultAPI, "Release API URL")
+	_ = f.MarkHidden("update-api")
+}
+
+func (o *updateOpts) validate() error {
+	if o.enabled && o.interval < minUpdateInterval {
+		return fmt.Errorf("update interval must be at least %s", minUpdateInterval)
+	}
+
+	return nil
+}
+
+func updateClient(api string) update.Client {
+	return update.Client{HTTP: &http.Client{Timeout: updateTimeout}, API: api}
+}
+
+// executablePath resolves symlinks so the real file is replaced, not the link.
+func executablePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+
+	exe, err = filepath.EvalSymlinks(exe)
+	if err != nil {
+		return "", fmt.Errorf("resolve executable symlink: %w", err)
+	}
+
+	return exe, nil
+}
+
+func newUpdate(info BuildInfo) *cobra.Command {
+	var (
+		check, force bool
+		api          string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "update",
+		Short: "Update this binary to the latest GitHub release",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cur, _ := info.resolved()
+			if cur == "dev" && !force {
+				return errDevBuild
+			}
+
+			c := updateClient(api)
+
+			rel, err := c.Latest(cmd.Context())
+			if err != nil {
+				return fmt.Errorf("check latest release: %w", err)
+			}
+
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "current %s, latest %s\n", cur, rel.Tag)
+
+			if check {
+				return nil
+			}
+
+			if !force {
+				newer, err := update.Newer(rel.Tag, cur)
+				if err != nil {
+					return fmt.Errorf("compare versions: %w", err)
+				}
+
+				if !newer {
+					fmt.Fprintln(out, "already up to date")
+					return nil
+				}
+			}
+
+			exe, err := executablePath()
+			if err != nil {
+				return err
+			}
+
+			if err := c.Apply(cmd.Context(), rel, exe); err != nil {
+				return fmt.Errorf("apply update: %w", err)
+			}
+
+			fmt.Fprintf(out, "updated to %s; restart running instances to apply\n", rel.Tag)
+
+			return nil
+		},
+	}
+
+	f := cmd.Flags()
+	f.BoolVar(&check, "check", false, "Only report the current and latest version")
+	f.BoolVar(&force, "force", false, "Install even when up to date or on a dev build")
+	f.StringVar(&api, "update-api", update.DefaultAPI, "Release API URL")
+	_ = f.MarkHidden("update-api")
+
+	return cmd
+}
+
+// autoUpdate checks once at start and then every interval until ctx ends. After installing
+// a release it asks for a restart and cancels the run so the normal drain happens first.
+func (a *app) autoUpdate(ctx context.Context, cancel context.CancelFunc, o updateOpts) {
+	cur, _ := a.info.resolved()
+	if cur == "dev" {
+		a.log.Warn("auto-update disabled for dev build")
+		return
+	}
+
+	c := updateClient(o.api)
+
+	tick := time.NewTicker(o.interval)
+	defer tick.Stop()
+
+	for {
+		if a.checkAndInstall(ctx, c, cur) {
+			a.restart.Store(true)
+			cancel()
+
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+	}
+}
+
+// checkAndInstall reports whether a newer release was installed.
+func (a *app) checkAndInstall(ctx context.Context, c update.Client, cur string) bool {
+	rel, err := c.Latest(ctx)
+	if err != nil {
+		a.log.Warn("update check failed", "err", err)
+		return false
+	}
+
+	newer, err := update.Newer(rel.Tag, cur)
+	if err != nil {
+		a.log.Warn("update check failed", "err", err)
+		return false
+	}
+
+	if !newer {
+		a.log.Debug("already up to date", "version", cur, "latest", rel.Tag)
+		return false
+	}
+
+	exe, err := executablePath()
+	if err == nil {
+		err = c.Apply(ctx, rel, exe)
+	}
+
+	if err != nil {
+		a.log.Warn("update failed", "err", err)
+		return false
+	}
+
+	a.log.Info("update installed, restarting", "from", cur, "to", rel.Tag)
+
+	return true
+}
+
+// runWithUpdate runs fn with the auto-update loop alongside and waits for the loop to exit.
+func (a *app) runWithUpdate(ctx context.Context, o updateOpts, fn func(context.Context) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	if !o.enabled {
+		return fn(ctx)
+	}
+
+	var wg sync.WaitGroup
+	wg.Go(func() { a.autoUpdate(ctx, cancel, o) })
+
+	err := fn(ctx)
+
+	cancel()
+	wg.Wait()
+
+	return err
+}
