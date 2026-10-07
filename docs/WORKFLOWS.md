@@ -34,8 +34,11 @@ flowchart TD
         CAccept --> CTls{TLS hello and cert set?}
         CTls -- yes --> CTerm[terminate TLS]
         CTls -- no --> CSess
-        CTerm --> CSess[get or create session]
-        CSess --> CHand[SMTP handshake if new]
+        CTerm --> CSess[pick least loaded slot]
+        CSess --> CGrow{every slot loaded<br/>and below pool-max?}
+        CGrow -- yes --> CDial[dial another session]
+        CGrow -- no --> COpen
+        CDial --> CHand[SMTP handshake]
         CHand --> COpen[open smux stream]
         COpen --> CRelay[relay raw bytes]
     end
@@ -79,17 +82,20 @@ sequenceDiagram
     S->>T: dial (30s, ACL after DNS, then socket options)
     S->>C: SOCKS reply, or 200 for CONNECT, or error status
     Note over S: log: tunnel opened peer, target, proto
-    C-->>T: relay.Pipe both ways
+    C-->>T: relay.PipeCount both ways
 ```
+
+The server has no closing audit line: its `tunnel opened` names the destination, and the client's `connection closed` carries the byte totals.
 
 For plain HTTP (absolute-form) there is no `200`: the server rewrites the request to origin-form (hop-by-hop headers stripped, `Connection: close`), writes it to the target, then relays the response. Request bytes after the header that were already buffered are relayed too.
 
-### 3. Client (`internal/tunnel/client.go`)
+### 3. Client (`internal/tunnel/client.go`, `internal/tunnel/pool.go`)
 
 1. Listen on `--listen` through the same tuned listener. `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
-2. Per accepted local connection (tracked in `conns`): 30s deadline, peek the first byte. If it is `0x16` and `--tls-cert`/`--tls-key` are set, terminate TLS (handshake bound by the same deadline). If it is `0x16` without a certificate, close with debug log `tls not enabled`. Then `getSession`.
-3. `getSession` under `sessMu`: reuse `Tunnel.sess` if open. Otherwise dial `--remote` (30s, tuned dialer, cancelled by shutdown), run the client handshake, wrap in the `--cipher` stream, `smux.Client`. One dial runs at a time; concurrent local connections wait for it and share the result. A dial that fails drops the session under the lock and retries once on a fresh one.
-4. Open a stream (on failure drop the session and retry once on a fresh one) and `relay.Pipe(local, stream)`. The application's proxy bytes (decrypted when TLS was terminated) travel unchanged to the server.
+2. Per accepted local connection (tracked in `conns`): 30s deadline, peek the first byte. If it is `0x16` and `--tls-cert`/`--tls-key` are set, terminate TLS (handshake bound by the same deadline). If it is `0x16` without a certificate, close with debug log `tls not enabled`. Then `pickSlot`.
+3. `pickSlot` reserves a stream on the healthy slot carrying the fewest streams. When every slot is loaded (`max(4, max-streams/8)` streams each) and the pool is below `--pool-max`, it dials another: `--remote` (30s, tuned dialer, cancelled by shutdown), client handshake, `--cipher` stream wrap, `smux.Client`. Growth is single-flight per slot, so concurrent local connections wait for the dial in progress and then take the least loaded slot. Closed slots are dropped on every pick; a stream open that fails removes its slot and retries on another.
+4. `relay.PipeCount(local, stream)`. The application's proxy bytes (decrypted when TLS was terminated) travel unchanged to the server. When the relay ends, one line is logged: `connection closed` with `peer` (the local application), `up`, `down` and `dur`. The client never parses the request, so no target appears in any client line.
+5. Closing that stream releases its slot reservation. If the slot is now empty it records the time, and the shrink scan that runs on every stream close drops any slot idle for 60s, down to `--pool-min`.
 
 ### 4. Update (`internal/update/`, `internal/cli/update.go`)
 
@@ -98,7 +104,10 @@ flowchart TD
     Trig{{"update command, or auto-update tick"}} --> Dev{dev build?}
     Dev -- "yes, no --force" --> Refuse[refuse / auto-update disabled]
     Dev -- no --> Latest[GET releases/latest]
-    Latest --> Newer{newer?}
+    Latest --> Sha{"API ends in /releases/latest?"}
+    Sha -- yes --> Commit[GET commits/tag, may fail]
+    Sha -- no --> Newer
+    Commit --> Newer{newer tag, or same tag from a different commit?}
     Newer -- "no, no --force" --> Done([up to date])
     Newer -- yes --> Dl[download zip + checksums.txt]
     Dl --> Sum{sha256 match?}
@@ -108,6 +117,8 @@ flowchart TD
     Mode -- no --> Msg([print: restart running instances])
     Mode -- yes --> Cancel[cancel ctx, drain] --> Exec([re-exec same args])
 ```
+
+The commit lookup is best effort: a failure there leaves the commit unknown and the check falls back to the tag comparison, rather than failing the update. `--check` prints both labels (`current vX~c, latest vY~s`) before anything is replaced.
 
 `auto-update` checks at start, then every `--update-interval`. Failures log a warn and keep the old binary running.
 
@@ -125,7 +136,7 @@ flowchart TD
 
 1. The signal cancels the run context. `RunServer` / `RunClient` stop accepting and return. In-flight connections keep running.
 2. The CLI logs `draining` (`active`, `timeout`) and calls `Tunnel.Shutdown` with a context limited by `--drain-timeout`. A second `SIGINT` / `SIGTERM` cancels that context and forces the end.
-3. Server sessions refuse new streams and close once idle. The client keeps its shared session for in-flight relays and closes it after the drain.
+3. Server sessions refuse new streams and close once idle. The client keeps its pooled sessions for in-flight relays and closes them after the drain.
 4. Clean drain: `shutdown complete`. Forced: warn `drain interrupted, connections closed`, then up to 5s for handler goroutines to exit.
 
 Auto-update runs the same drain before it re-executes.
@@ -138,11 +149,14 @@ Run these by hand. Nothing here is a CI gate: shared runners are too noisy to as
 
 | Step | Command | Expect |
 |---|---|---|
-| Per-layer numbers | `make bench` (or `make bench-short`) | Relay near memory speed, AES seal above 2 GB/s, XOR seal above 400 MB/s, `BenchmarkProxyThroughput` per cipher and stream count |
+| Per-layer numbers | `make bench` (or `make bench-short`) | Relay near memory speed, AES seal above 2 GB/s, XOR seal above 400 MB/s, `BenchmarkProxyThroughput` per cipher, stream count and pooled case |
 | Direct baseline | `curl -o /dev/null --limit-rate 100M http://host/file` | Transfer finishes at the cap, so the link is the limit |
-| Through the proxy | Same URL with `-x socks5h://127.0.0.1:1080` | Within 80% of the direct run at caps up to 100M |
+| Through the proxy | Same URL with `-x socks5h://127.0.0.1:1080` | Within 80% of the direct run at caps up to 100M. Measured on loopback: 99% (`aes`), 100% (`xor`) |
 | Single long-fat stream | One `iperf3 -c host` through the client | Underruns on a high-RTT link: that is the `window / RTT` ceiling, not a fault |
 | Multi-stream | Several transfers at once, or `iperf3 -P 8` | Aggregate approaches line rate; streams needed per RTT in [Architecture](ARCHITECTURE.md#throughput) |
+| Pool grows | Run the client with `--log-level debug` and drive concurrent transfers, then check the server's connection count | One TCP connection per client until a slot is loaded, then another, up to `--pool-max`. Debug log `session pool shrunk` when it drops back |
+| Pool aggregate | N parallel capped transfers, direct versus through the client | Proxied total rises with the number of sessions and passes what one session alone could carry |
+| Bad pool bounds | `--pool-min 9 --pool-max 8`, or `--pool-max 99` | Exit 1 at startup: `pool-min must not exceed pool-max`, `pool sizes must be between 1 and 16` |
 
 Cipher stays `--cipher aes` for these: both ciphers measure the same end to end at the CPU ceiling, and AES is the default.
 
@@ -166,11 +180,11 @@ Cipher stays `--cipher aes` for these: both ciphers measure the same end to end 
 | Handshake fails or times out (30s) | Connection closed, no reply. Logged at debug (`handshake rejected`) |
 | Wrong proof or malformed nonce | Connection closed, no reply. Debug log `handshake rejected` |
 | Handshake line over 4KB, or over 16 `250-` replies | Connection closed, no reply. Debug log `handshake rejected` |
-| Cipher differs between ends | Handshake succeeds, then the first AES record fails to open: session dropped, next local connection re-dials |
-| AES record fails authentication (wrong key, tampered data, lost position) | Stream error, session dropped. Warn `open stream failed` on the client |
-| Client cannot dial server or handshake fails | Log `open stream failed` (warn) with `err`, local connection closed. Next local connection retries |
-| smux session closed or keepalive times out (60s) | Next local connection creates a new session |
-| Stream open fails on a stale session | Session dropped, one retry on a fresh session |
+| Cipher differs between ends | Handshake succeeds, then the first AES record fails to open: slot evicted, next local connection re-dials |
+| AES record fails authentication (wrong key, tampered data, lost position) | Stream error, slot evicted. Warn `open stream failed` on the client |
+| Client cannot dial server or handshake fails | Log `open stream failed` (warn) with `err`, local connection closed. An existing slot still takes the stream; otherwise the next local connection retries |
+| smux session closed or keepalive times out (60s) | The slot is dropped on the next pick, and a new session is dialed |
+| Stream open fails on a stale session | That slot is evicted and the open retries on another, up to one attempt per possible slot |
 | First byte is not `0x05`, `0x04` or `A`-`Z` | Stream closed. Debug log `proxy request rejected` |
 | Stream beyond `--max-streams` (default 128) on a session | Stream closed at once. Debug log `stream refused` |
 | `RunServer`/`RunClient` after `Shutdown` | Returns `tunnel is shut down`, no listener started. `Shutdown` before any Run returns nil |
@@ -195,6 +209,9 @@ Cipher stays `--cipher aes` for these: both ciphers measure the same end to end 
 | Drain exceeds `--drain-timeout`, or a second signal arrives | Warn `drain interrupted, connections closed`, remaining connections cut, process exits |
 | Negative `--drain-timeout`, `--tls-cert` without `--tls-key`, unreadable key pair | Exit 1 at startup |
 | Update check fails (network, GitHub rate limit 403/429) | `update` exits 1. Auto-update warns `update check failed` and retries next interval |
+| Commit lookup for the release tag fails (404, network, malformed JSON) | Not an error: the commit stays unknown, the check continues on the tag alone |
+| Same tag, different commit | Treated as an update: manual `update` reinstalls, auto-update swaps and restarts |
+| Same tag, either commit unknown or running build dirty | Not an update. Avoids reinstalling the same binary on every interval |
 | Checksum mismatch or missing asset for this platform | Error, binary untouched. Auto-update warns `update failed` |
 | Stale `<exe>.old` from a previous Windows update | Removed and the rename retried once, so the update still succeeds |
 | Binary location not writable | Error with permission hint, binary untouched |

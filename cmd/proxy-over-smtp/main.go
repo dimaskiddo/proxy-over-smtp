@@ -14,18 +14,18 @@ import (
 	"github.com/dimaskiddo/proxy-over-smtp/internal/update"
 )
 
-// Build info, overwritten at link time through -ldflags -X by GoReleaser and the Dockerfile.
+// Build info, overwritten at link time through -ldflags -X by the Makefile, GoReleaser and the
+// Dockerfile.
 var (
 	version = "dev"
 	commit  = "none"
-	date    = "unknown"
 )
 
 // main runs the CLI, re-execs the binary after an auto-update and exits 1 on error.
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 
-	restart, err := cli.Execute(ctx, cli.BuildInfo{Version: version, Commit: commit, Date: date})
+	restart, err := cli.Execute(ctx, cli.BuildInfo{Version: version, Commit: commit})
 	stop()
 
 	if restart {

@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -245,6 +246,72 @@ func echoListener(t testing.TB) net.Listener {
 	return ln
 }
 
+// syncBuffer is a bytes.Buffer safe to read while handler goroutines write to it.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+// Write appends p under the lock.
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.buf.Write(p)
+}
+
+// String returns everything written so far.
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.buf.String()
+}
+
+// TestClientConnectionLog checks the client audits each proxied connection with the local peer
+// only: the target is not parsed on this side, so it must never appear in a client line.
+func TestClientConnectionLog(t *testing.T) {
+	p := newPair(t, config.Config{})
+
+	var out syncBuffer
+	p.cli.log = slog.New(slog.NewTextHandler(&out, nil))
+
+	echo := echoListener(t)
+	echoAddr := echo.Addr().String()
+
+	// Through the local proxy port, not a bare stream: the log line is emitted by handleClient.
+	c := dialClient(t, p)
+	roundTrip(t, socksConnectOn(t, c, echo.Addr()))
+	c.Close()
+
+	deadline := time.Now().Add(5 * time.Second)
+
+	var line string
+	for time.Now().Before(deadline) {
+		if line = out.String(); strings.Contains(line, "connection closed") {
+			break
+		}
+
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	if !strings.Contains(line, "connection closed") {
+		t.Fatalf("no client connection line in %q", line)
+	}
+
+	if !strings.Contains(line, "peer=127.0.0.1:") {
+		t.Fatalf("client line missing the local peer in %q", line)
+	}
+
+	if !strings.Contains(line, "up=") || !strings.Contains(line, "down=") {
+		t.Fatalf("client line missing transfer counts in %q", line)
+	}
+
+	if strings.Contains(line, "target=") || strings.Contains(line, echoAddr) {
+		t.Fatalf("client line leaks the target in %q", line)
+	}
+}
+
 func TestTunnelStreams(t *testing.T) {
 	for _, cipher := range []string{config.CipherAES, config.CipherXOR} {
 		t.Run(cipher, func(t *testing.T) {
@@ -283,21 +350,35 @@ func TestTunnelStreams(t *testing.T) {
 
 // BenchmarkProxyThroughput pumps bytes through a real client and server pair over loopback and
 // drains them back through an echo target. stream counts concurrent proxied connections, which is
-// how a link above one stream's window/RTT ceiling is meant to be driven. Numbers are
-// informational, not a gate.
+// how a link above one stream's window/RTT ceiling is meant to be driven. The pooled case keeps
+// four streams per session, so it spans two sessions: that is the aggregate shape a multi-gigabit
+// link needs. Numbers are informational, not a gate.
 func BenchmarkProxyThroughput(b *testing.B) {
+	cases := []struct {
+		name    string
+		cfg     config.Config
+		streams int
+	}{
+		{"single", config.Config{}, 1},
+		{"multi", config.Config{}, 8},
+		{"pooled", config.Config{PoolMin: 1, PoolMax: 4, MaxStreams: 4}, 8},
+	}
+
 	for _, cipher := range []string{config.CipherAES, config.CipherXOR} {
-		for _, streams := range []int{1, 8} {
-			b.Run(fmt.Sprintf("%s/%dstreams", cipher, streams), func(b *testing.B) {
-				cli := newPair(b, config.Config{Cipher: cipher}).cli
+		for _, tc := range cases {
+			b.Run(fmt.Sprintf("%s/%s/%dstreams", cipher, tc.name, tc.streams), func(b *testing.B) {
+				cfg := tc.cfg
+				cfg.Cipher = cipher
+
+				cli := newPair(b, cfg).cli
 				echo := echoListener(b)
 
 				// Sized so one round is one relay buffer; each stream reads its own echo back, so a
 				// paused reader cannot stall the session.
 				payload := make([]byte, 128*1024)
-				total := int64(len(payload)) * int64(streams)
+				total := int64(len(payload)) * int64(tc.streams)
 
-				conns := make([]io.ReadWriteCloser, streams)
+				conns := make([]io.ReadWriteCloser, tc.streams)
 				for i := range conns {
 					conns[i] = socksConnect(b, cli, echo.Addr())
 				}

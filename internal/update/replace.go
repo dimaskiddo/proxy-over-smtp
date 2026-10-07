@@ -79,12 +79,32 @@ func cleanOld(exe string) {
 	_ = os.Remove(exe + oldSuffix)
 }
 
+// ExecutablePath returns the running binary's real path, so a caller replaces and re-executes
+// the file the process image came from rather than a symlink pointing at it. A link that cannot
+// be resolved leaves the os.Executable path, which on Linux is already the resolved target.
+func ExecutablePath() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("resolve executable: %w", err)
+	}
+
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	}
+
+	return exe, nil
+}
+
 // moveAside renames the running executable out of the way. A leftover .old that cleanOld could
 // not remove makes the first rename fail, so that case removes the stale file and retries once;
 // otherwise a second consecutive update would never succeed.
 func moveAside(exe string) error {
 	err := os.Rename(exe, exe+oldSuffix)
-	if err == nil || !errors.Is(err, fs.ErrExist) {
+	if err == nil {
+		return nil
+	}
+
+	if !errors.Is(err, fs.ErrExist) {
 		return wrapPerm(fmt.Errorf("move old binary aside: %w", err))
 	}
 
@@ -92,7 +112,11 @@ func moveAside(exe string) error {
 		return wrapPerm(fmt.Errorf("move old binary aside: %w", err))
 	}
 
-	return wrapPerm(fmt.Errorf("move old binary aside: %w", os.Rename(exe, exe+oldSuffix)))
+	if err := os.Rename(exe, exe+oldSuffix); err != nil {
+		return wrapPerm(fmt.Errorf("move old binary aside: %w", err))
+	}
+
+	return nil
 }
 
 // wrapPerm adds a hint to permission errors, the usual failure when the binary sits in a

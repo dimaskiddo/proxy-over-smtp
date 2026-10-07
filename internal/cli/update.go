@@ -5,8 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -56,19 +54,15 @@ func updateClient(api string) update.Client {
 	return update.Client{HTTP: &http.Client{Timeout: updateTimeout}, API: api}
 }
 
-// executablePath resolves symlinks so the real file is replaced, not the link.
-func executablePath() (string, error) {
-	exe, err := os.Executable()
-	if err != nil {
-		return "", fmt.Errorf("resolve executable: %w", err)
+// buildLabel is the one place a version and commit become a label, so an update message and the
+// running binary's own line (BuildInfo.String) can never disagree. An unknown commit is left off
+// rather than shown as "none".
+func buildLabel(version, commit string) string {
+	if commit == "" || commit == "none" {
+		return version
 	}
 
-	exe, err = filepath.EvalSymlinks(exe)
-	if err != nil {
-		return "", fmt.Errorf("resolve executable symlink: %w", err)
-	}
-
-	return exe, nil
+	return version + "~" + commit
 }
 
 // newUpdate returns the update command. With --check it only reports; otherwise it installs
@@ -84,7 +78,7 @@ func newUpdate(info BuildInfo) *cobra.Command {
 		Short: "Update this binary to the latest GitHub release",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cur, _ := info.resolved()
+			cur, curCommit := info.resolved()
 			if cur == "dev" && !force {
 				return errDevBuild
 			}
@@ -97,25 +91,26 @@ func newUpdate(info BuildInfo) *cobra.Command {
 			}
 
 			out := cmd.OutOrStdout()
-			fmt.Fprintf(out, "current %s, latest %s\n", cur, rel.Tag)
+			fmt.Fprintf(out, "current %s, latest %s\n", buildLabel(cur, curCommit), buildLabel(rel.Tag, rel.Commit))
 
 			if check {
 				return nil
 			}
 
 			if !force {
-				newer, err := update.Newer(rel.Tag, cur)
+				// A newer tag or the same tag from a different commit both count as "replace it".
+				replace, err := update.ShouldUpdate(rel.Tag, rel.Commit, cur, curCommit)
 				if err != nil {
 					return fmt.Errorf("compare versions: %w", err)
 				}
 
-				if !newer {
+				if !replace {
 					fmt.Fprintln(out, "already up to date")
 					return nil
 				}
 			}
 
-			exe, err := executablePath()
+			exe, err := update.ExecutablePath()
 			if err != nil {
 				return err
 			}
@@ -124,7 +119,7 @@ func newUpdate(info BuildInfo) *cobra.Command {
 				return fmt.Errorf("apply update: %w", err)
 			}
 
-			fmt.Fprintf(out, "updated to %s; restart running instances to apply\n", rel.Tag)
+			fmt.Fprintf(out, "updated to %s; restart running instances to apply\n", buildLabel(rel.Tag, rel.Commit))
 
 			return nil
 		},
@@ -142,7 +137,7 @@ func newUpdate(info BuildInfo) *cobra.Command {
 // autoUpdate checks once at start and then every interval until ctx ends. After installing
 // a release it asks for a restart and cancels the run so the normal drain happens first.
 func (a *app) autoUpdate(ctx context.Context, cancel context.CancelFunc, o updateOpts) {
-	cur, _ := a.info.resolved()
+	cur, curCommit := a.info.resolved()
 	if cur == "dev" {
 		a.log.Warn("auto-update disabled for dev build")
 		return
@@ -154,7 +149,7 @@ func (a *app) autoUpdate(ctx context.Context, cancel context.CancelFunc, o updat
 	defer tick.Stop()
 
 	for {
-		if a.checkAndInstall(ctx, c, cur) {
+		if a.checkAndInstall(ctx, c, cur, curCommit) {
 			a.restart.Store(true)
 			cancel()
 
@@ -169,26 +164,26 @@ func (a *app) autoUpdate(ctx context.Context, cancel context.CancelFunc, o updat
 	}
 }
 
-// checkAndInstall reports whether a newer release was installed.
-func (a *app) checkAndInstall(ctx context.Context, c update.Client, cur string) bool {
+// checkAndInstall reports whether a release was installed.
+func (a *app) checkAndInstall(ctx context.Context, c update.Client, cur, curCommit string) bool {
 	rel, err := c.Latest(ctx)
 	if err != nil {
 		a.log.Warn("update check failed", "err", err)
 		return false
 	}
 
-	newer, err := update.Newer(rel.Tag, cur)
+	replace, err := update.ShouldUpdate(rel.Tag, rel.Commit, cur, curCommit)
 	if err != nil {
 		a.log.Warn("update check failed", "err", err)
 		return false
 	}
 
-	if !newer {
-		a.log.Debug("already up to date", "version", cur, "latest", rel.Tag)
+	if !replace {
+		a.log.Debug("already up to date", "version", buildLabel(cur, curCommit), "latest", buildLabel(rel.Tag, rel.Commit))
 		return false
 	}
 
-	exe, err := executablePath()
+	exe, err := update.ExecutablePath()
 	if err == nil {
 		err = c.Apply(ctx, rel, exe)
 	}
@@ -198,7 +193,7 @@ func (a *app) checkAndInstall(ctx context.Context, c update.Client, cur string) 
 		return false
 	}
 
-	a.log.Info("update installed, restarting", "from", cur, "to", rel.Tag)
+	a.log.Info("update installed, restarting", "from", buildLabel(cur, curCommit), "to", buildLabel(rel.Tag, rel.Commit))
 
 	return true
 }

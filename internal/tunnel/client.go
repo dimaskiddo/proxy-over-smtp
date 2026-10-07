@@ -32,14 +32,25 @@ func (t *Tunnel) RunClient(ctx context.Context) error {
 	})
 }
 
-// closeSession closes the shared session, if any. Streams on it end with an error.
+// closeSession closes every pooled session, if any, and stops the pool from dialing more.
+// Streams on them end with an error.
 func (t *Tunnel) closeSession() {
-	t.sessMu.Lock()
-	defer t.sessMu.Unlock()
+	t.poolMu.Lock()
 
-	if t.sess != nil {
-		t.sess.Close()
-		t.sess = nil
+	var sessions []*smux.Session
+
+	for _, s := range t.slots {
+		if s.sess != nil {
+			sessions = append(sessions, s.sess)
+		}
+	}
+
+	t.slots = nil
+	t.closed = true
+	t.poolMu.Unlock()
+
+	for _, sess := range sessions {
+		sess.Close()
 	}
 }
 
@@ -85,91 +96,20 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 
 	remoteStream, err := t.openStream(ctx)
 	if err != nil {
-		t.log.Warn("open stream failed", "err", err)
+		t.log.Warn("open stream failed", "peer", local.RemoteAddr().String(), "err", err)
 		return
 	}
 	defer remoteStream.Close()
 
-	relay.Pipe(app, remoteStream)
-}
+	// Only the local peer is logged, never the target: the client does not parse the request,
+	// so the destination is not known here, and it stays the server's audit field.
+	peer := local.RemoteAddr().String()
+	start := time.Now()
 
-// openStream opens a stream on the shared session, creating the session if needed. It retries
-// once on a fresh session: a peer restart leaves a dead session that IsClosed reports as open
-// until keepalive times out.
-func (t *Tunnel) openStream(ctx context.Context) (*smux.Stream, error) {
-	var err error
-	for range 2 {
-		var sess *smux.Session
-		if sess, err = t.getSession(ctx); err != nil {
-			return nil, err
-		}
+	up, down := relay.PipeCount(app, remoteStream)
 
-		var s *smux.Stream
-		if s, err = sess.OpenStream(); err == nil {
-			return s, nil
-		}
-
-		// Drop the failed session under the lock, and only while it is still the shared one, so a
-		// session another goroutine just installed is not closed underneath it.
-		t.sessMu.Lock()
-		if t.sess == sess {
-			t.sess = nil
-		}
-		t.sessMu.Unlock()
-
-		sess.Close()
-	}
-
-	return nil, err
-}
-
-// getSession returns the open shared session, dialing the server and running the handshake
-// when there is none. Only one dial runs at a time: a second caller waits for it and then reuses
-// its result, so a burst of local connections opens one TCP connection instead of one each. The
-// lock is never held across the dial, so an established session never waits behind a slow one.
-func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
-	for {
-		t.sessMu.Lock()
-
-		if t.sess != nil && !t.sess.IsClosed() {
-			sess := t.sess
-			t.sessMu.Unlock()
-
-			return sess, nil
-		}
-
-		if wait := t.dialing; wait != nil {
-			t.sessMu.Unlock()
-
-			select {
-			case <-wait:
-				continue
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-
-		done := make(chan struct{})
-		t.dialing = done
-		t.sessMu.Unlock()
-
-		sess, err := t.dialSession(ctx)
-
-		t.sessMu.Lock()
-		t.dialing = nil
-		if err == nil {
-			t.sess = sess
-		}
-		t.sessMu.Unlock()
-
-		close(done)
-
-		if err != nil {
-			return nil, err
-		}
-
-		return sess, nil
-	}
+	t.log.Info("connection closed",
+		"peer", peer, "up", up, "down", down, "dur", time.Since(start).Round(time.Millisecond).String())
 }
 
 // dialSession dials the server, runs the handshake and wraps the connection in a new session.

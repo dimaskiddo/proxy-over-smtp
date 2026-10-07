@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path"
 	"runtime"
 	"strconv"
@@ -23,7 +24,6 @@ import (
 
 // DefaultAPI is the GitHub latest-release endpoint.
 const DefaultAPI = "https://api.github.com/repos/dimaskiddo/proxy-over-smtp/releases/latest"
-
 const (
 	// binaryName is the archive prefix and the executable name inside it. It must match the
 	// GoReleaser project name.
@@ -32,12 +32,23 @@ const (
 	checksumsName = "checksums.txt"
 	// maxDownload caps memory use, because the archive is held in memory while it is verified.
 	maxDownload = 100 << 20
+	// latestSuffix is the part of DefaultAPI that the release base URL is derived from, so the
+	// tag-to-commit lookup can be built from a custom --update-api too.
+	latestSuffix = "/releases/latest"
+	// minCommit is the shortest commit prefix treated as meaningful. Git's own abbreviation
+	// floor, so a full SHA and a 7-character short SHA compare as the same commit.
+	minCommit = 7
 )
 
-// Release is a published release: its tag and asset name to download URL.
+// Release is a published release: its tag, the commit the tag points at when it could be
+// resolved, and the asset name to download URL.
 type Release struct {
 	// Tag is the release tag, for example "v1.2.3".
 	Tag string
+	// Commit is the full commit SHA the tag resolves to, or empty when the API could not be
+	// asked. Empty means "unknown": it is never treated as a differing commit, only as "no
+	// opinion", so a failed lookup degrades to tag-only comparison.
+	Commit string
 	// Assets maps an asset file name to its download URL.
 	Assets map[string]string
 }
@@ -122,7 +133,37 @@ func (c Client) Latest(ctx context.Context) (Release, error) {
 		rel.Assets[a.Name] = a.URL
 	}
 
+	// The release payload carries no commit, so the tag is resolved separately. A failure here
+	// is not a failure of the check: the tag comparison still stands on its own.
+	if base, ok := strings.CutSuffix(c.API, latestSuffix); ok {
+		if sha, err := c.tagCommit(ctx, base, rel.Tag); err == nil {
+			rel.Commit = sha
+		}
+	}
+
 	return rel, nil
+}
+
+// tagCommit resolves a tag to the commit it points at, through the commits endpoint. GitHub
+// dereferences an annotated tag there itself, so one request is enough.
+func (c Client) tagCommit(ctx context.Context, base, tag string) (string, error) {
+	body, err := c.get(ctx, base+"/commits/"+url.PathEscape(tag), "application/vnd.github+json", 1<<20)
+	if err != nil {
+		return "", err
+	}
+
+	var raw struct {
+		SHA string `json:"sha"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return "", fmt.Errorf("decode commit: %w", err)
+	}
+
+	if raw.SHA == "" {
+		return "", errors.New("commit has no sha")
+	}
+
+	return raw.SHA, nil
 }
 
 // Apply downloads the asset for this platform, verifies its sha256 and replaces exe.
@@ -242,9 +283,76 @@ func assetName(version, goos, goarch string) (string, error) {
 	return fmt.Sprintf("%s_%s_%s_%s.zip", binaryName, version, o, a), nil
 }
 
+// ShouldUpdate reports whether the running build should be replaced by the release. It is true
+// when the release tag is newer, and also when the tag is the same but the running build came
+// from a different commit: a re-tagged release is still a different binary.
+//
+// The commit comparison is deliberately one-sided on missing data. It only fires when both
+// commits are known and neither is dirty, because an unknown commit means "no opinion" and
+// guessing would reinstall the same binary on every check. It is also unordered: a tag that
+// moves backwards reads as different, which is what a re-tag is, so the caller's interval is
+// what bounds any back-and-forth.
+func ShouldUpdate(latestTag, latestCommit, curTag, curCommit string) (bool, error) {
+	newer, err := Newer(latestTag, curTag)
+	if err != nil {
+		return false, err
+	}
+
+	if newer {
+		return true, nil
+	}
+
+	// Same tag only. A newer running build, or an unparsable one, is not a downgrade candidate.
+	l, err := parseVersion(latestTag)
+	if err != nil {
+		return false, err
+	}
+
+	c, err := parseVersion(curTag)
+	if err != nil {
+		return false, err
+	}
+
+	if l != c {
+		return false, nil
+	}
+
+	// A dirty build has local changes the release cannot carry, so its commit never matches.
+	if strings.Contains(curTag, "dirty") || !knownCommit(curCommit) {
+		return false, nil
+	}
+
+	if !knownCommit(latestCommit) {
+		return false, nil
+	}
+
+	return !sameCommit(latestCommit, curCommit), nil
+}
+
+// knownCommit reports whether a commit value identifies a commit. The linker default "none"
+// and an unresolved empty value both mean the build cannot be told apart by commit.
+func knownCommit(c string) bool {
+	return c != "" && c != "none"
+}
+
+// sameCommit compares two commit values that may differ in length, because the release and the
+// linker abbreviate a SHA independently. Equal under a common prefix of at least minCommit
+// characters is the same commit. Two values shorter than that cannot be told apart, so they are
+// reported as the same: an ambiguous pair must never trigger a reinstall.
+func sameCommit(a, b string) bool {
+	a, b = strings.ToLower(a), strings.ToLower(b)
+
+	n := min(len(a), len(b))
+	if n < minCommit {
+		return true
+	}
+
+	return a[:n] == b[:n]
+}
+
 // Newer reports whether latest is a higher X.Y.Z than current. Any "-pre" or "+meta" suffix
 // is ignored, so git-describe builds compare by their base tag.
-// ponytail: pre-release ordering is not handled; switch to x/mod/semver if it is needed.
+// pre-release ordering is not handled; switch to x/mod/semver if it is needed.
 func Newer(latest, current string) (bool, error) {
 	l, err := parseVersion(latest)
 	if err != nil {

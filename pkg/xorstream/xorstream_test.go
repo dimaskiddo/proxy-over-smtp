@@ -77,8 +77,8 @@ func TestRoundTrip(t *testing.T) {
 }
 
 func TestEmptyKey(t *testing.T) {
-	if _, err := New(&bytes.Buffer{}, ""); err != ErrEmptyKey {
-		t.Fatalf("got %v want %v", err, ErrEmptyKey)
+	if _, err := New(&bytes.Buffer{}, ""); err != errEmptyKey {
+		t.Fatalf("got %v want %v", err, errEmptyKey)
 	}
 }
 

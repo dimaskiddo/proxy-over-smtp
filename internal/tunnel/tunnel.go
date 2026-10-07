@@ -14,8 +14,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xtaci/smux"
-
 	"github.com/dimaskiddo/proxy-over-smtp/internal/config"
 )
 
@@ -32,6 +30,9 @@ const (
 	minBackoff = 5 * time.Millisecond
 	maxBackoff = time.Second
 )
+
+// errShutdown is returned when a session is requested after Shutdown has closed the pool.
+var errShutdown = errors.New("tunnel is shut down")
 
 // Tunnel is one server or client instance. Run it with RunServer or RunClient, then end it
 // with Shutdown. A Tunnel must not be reused after Shutdown.
@@ -52,12 +53,14 @@ type Tunnel struct {
 	hard       context.Context
 	hardCancel context.CancelFunc
 
-	// sess is the client's shared session, guarded by sessMu. A server never sets it. dialing is
-	// non-nil while one dial runs, so concurrent local connections wait for it instead of each
-	// opening their own TCP connection.
-	sessMu  sync.Mutex
-	sess    *smux.Session
-	dialing chan struct{}
+	// poolMu guards slots, the client's session pool. A server never sets it. Each slot is one
+	// TCP connection carrying one smux session, and a local connection is pinned to one slot, so
+	// the pool multiplies aggregate throughput rather than the speed of a single flow.
+	poolMu sync.Mutex
+	slots  []*slot
+	// closed is set by closeSession so a pick or a dial running alongside it stops instead of
+	// opening a session that nothing would ever close.
+	closed bool
 }
 
 // New returns a Tunnel for cfg. When cfg sets TLSCert and TLSKey the key pair is loaded now
@@ -73,6 +76,13 @@ func New(cfg config.Config, logger *slog.Logger) (*Tunnel, error) {
 	// unlimited streams.
 	if cfg.MaxStreams <= 0 {
 		cfg.MaxStreams = config.DefaultMaxStreams
+	}
+
+	// Both zero means the pool was never configured, which is how a server or a bare client
+	// arrives. The defaults are filled in here rather than in the pool, where an unset maximum
+	// would silently disable growth.
+	if cfg.PoolMin == 0 && cfg.PoolMax == 0 {
+		cfg.PoolMin, cfg.PoolMax = config.DefaultPoolMin, config.DefaultPoolMax
 	}
 
 	t := &Tunnel{cfg: cfg, log: logger}
@@ -183,7 +193,7 @@ func (t *Tunnel) acceptLoop(ctx context.Context, ln net.Listener, handle func(ne
 	t.shutMu.Unlock()
 
 	if shut {
-		return errors.New("tunnel is shut down")
+		return errShutdown
 	}
 
 	backoff := minBackoff
@@ -217,7 +227,7 @@ func (t *Tunnel) acceptLoop(ctx context.Context, ln net.Listener, handle func(ne
 			handle(conn)
 		}) {
 			conn.Close()
-			return errors.New("tunnel is shut down")
+			return errShutdown
 		}
 	}
 }

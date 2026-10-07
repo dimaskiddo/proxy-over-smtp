@@ -8,8 +8,9 @@ import (
 	"sync"
 )
 
-// ErrEmptyKey is returned by New when the key has no bytes.
-var ErrEmptyKey = errors.New("xorstream: empty key")
+// errEmptyKey is returned by New when the key has no bytes. It stays unexported because no
+// caller distinguishes it: the tunnel rejects an empty secret long before this point.
+var errEmptyKey = errors.New("xorstream: empty key")
 
 // Stream XORs everything read and written with a rolling key. Obfuscation only.
 type Stream struct {
@@ -30,7 +31,7 @@ type Stream struct {
 // New wraps rw. Both ends must use the same key.
 func New(rw io.ReadWriter, key string) (*Stream, error) {
 	if key == "" {
-		return nil, ErrEmptyKey
+		return nil, errEmptyKey
 	}
 
 	return &Stream{

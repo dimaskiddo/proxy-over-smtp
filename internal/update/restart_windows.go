@@ -11,9 +11,9 @@ import (
 // Restart starts the on-disk binary as a child. Windows has no exec, so the caller exits
 // afterwards.
 func Restart() error {
-	exe, err := os.Executable()
+	exe, err := ExecutablePath()
 	if err != nil {
-		return fmt.Errorf("resolve executable: %w", err)
+		return err
 	}
 
 	cmd := exec.Command(exe, os.Args[1:]...)

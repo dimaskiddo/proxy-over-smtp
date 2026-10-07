@@ -92,14 +92,14 @@ func newApp(info BuildInfo, out io.Writer) (*cobra.Command, *app) {
 	return root, a
 }
 
-// newVersion returns the version command, which prints build info and the author.
+// newVersion returns the version command, which prints the one-line build info.
 func newVersion(info BuildInfo) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Print version information",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintf(cmd.OutOrStdout(), "%s\nBy Dimas Restu H <drh.dimasrestu@gmail.com>\n", info.String())
+			fmt.Fprintln(cmd.OutOrStdout(), info.String())
 		},
 	}
 }
@@ -141,7 +141,7 @@ func newServer(a *app) *cobra.Command {
 	f.StringVar(&cfg.Listen, "listen", "0.0.0.0:465", "Server listen address")
 	f.StringVar(&cfg.Secret, "secret", "", "Shared secret: handshake authentication and stream key master (prefer the env var)")
 	f.StringVar(&cfg.Cipher, "cipher", config.CipherAES, "Stream cipher: xor or aes (both ends must match)")
-	f.IntVar(&cfg.MaxStreams, "max-streams", config.DefaultMaxStreams, "Max concurrent streams per session (server-enforced; the client value is ignored)")
+	f.IntVar(&cfg.MaxStreams, "max-streams", config.DefaultMaxStreams, "Max concurrent streams per session (server-enforced; on the client, the load at which the pool grows)")
 	f.BoolVar(&cfg.AllowPrivate, "allow-private", false, "Allow loopback, private and link-local targets")
 	f.DurationVar(&a.drain, "drain-timeout", defaultDrain, "How long to wait for open connections on shutdown")
 	upd.bind(cmd)
@@ -192,7 +192,9 @@ func newClient(a *app) *cobra.Command {
 	f.StringVar(&cfg.Remote, "remote", "127.0.0.1:465", "Server address the client dials")
 	f.StringVar(&cfg.Secret, "secret", "", "Shared secret: handshake authentication and stream key master (prefer the env var)")
 	f.StringVar(&cfg.Cipher, "cipher", config.CipherAES, "Stream cipher: xor or aes (both ends must match)")
-	f.IntVar(&cfg.MaxStreams, "max-streams", config.DefaultMaxStreams, "Max concurrent streams per session (server-enforced; the client value is ignored)")
+	f.IntVar(&cfg.MaxStreams, "max-streams", config.DefaultMaxStreams, "Max concurrent streams per session (server-enforced; on the client, the load at which the pool grows)")
+	f.IntVar(&cfg.PoolMin, "pool-min", config.DefaultPoolMin, "Min tunnel sessions the client keeps open (client-only)")
+	f.IntVar(&cfg.PoolMax, "pool-max", config.DefaultPoolMax, "Max tunnel sessions the client opens under load (client-only)")
 	f.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM certificate to also accept TLS proxy connections (needs --tls-key)")
 	f.StringVar(&cfg.TLSKey, "tls-key", "", "PEM private key for --tls-cert")
 	f.DurationVar(&a.drain, "drain-timeout", defaultDrain, "How long to wait for open connections on shutdown")

@@ -204,8 +204,8 @@ func TestWrongKey(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v want ErrAuth", err)
+	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, errAuth) {
+		t.Fatalf("got %v want errAuth", err)
 	}
 }
 
@@ -230,8 +230,8 @@ func TestTamperedTag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, ErrAuth) {
-		t.Fatalf("got %v want ErrAuth", err)
+	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, errAuth) {
+		t.Fatalf("got %v want errAuth", err)
 	}
 }
 
@@ -246,8 +246,8 @@ func TestRecordTooLarge(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Read(make([]byte, 16)); !errors.Is(err, ErrRecordTooLarge) {
-		t.Fatalf("got %v want ErrRecordTooLarge", err)
+	if _, err := r.Read(make([]byte, 16)); !errors.Is(err, errRecordTooLarge) {
+		t.Fatalf("got %v want errRecordTooLarge", err)
 	}
 }
 
@@ -271,8 +271,8 @@ func TestTruncatedRecord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, ErrShortRecord) {
-		t.Fatalf("got %v want ErrShortRecord", err)
+	if _, err := r.Read(make([]byte, 32)); !errors.Is(err, errShortRecord) {
+		t.Fatalf("got %v want errShortRecord", err)
 	}
 }
 

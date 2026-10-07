@@ -16,6 +16,109 @@ import (
 	"testing"
 )
 
+func TestShouldUpdate(t *testing.T) {
+	const sha = "c04bfca9d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
+
+	tests := []struct {
+		name                    string
+		latestTag, latestCommit string
+		curTag, curCommit       string
+		want, wantErr           bool
+	}{
+		{"newer tag", "v0.1.0", sha, "v0.0.3", sha, true, false},
+		{"newer tag, unknown commits", "v0.1.0", "", "v0.0.3", "", true, false},
+		{"same tag, different commit", "v0.0.3", sha, "v0.0.3", strings.Repeat("a", 40), true, false},
+		{"same tag, same commit", "v0.0.3", sha, "v0.0.3", sha, false, false},
+		{"same tag, short vs full commit", "v0.0.3", sha, "v0.0.3", sha[:7], false, false},
+		{"same tag, commit case differs", "v0.0.3", strings.ToUpper(sha), "v0.0.3", sha, false, false},
+		{"same tag, release commit unknown", "v0.0.3", "", "v0.0.3", sha, false, false},
+		{"same tag, running commit unknown", "v0.0.3", sha, "v0.0.3", "none", false, false},
+		{"same tag, both commits unknown", "v0.0.3", "none", "v0.0.3", "", false, false},
+		{"same tag, running build dirty", "v0.0.3", sha, "v0.0.3-1-g09f0e68-dirty", sha[:7], false, false},
+		{"same tag, commit too short to compare", "v0.0.3", "abc", "v0.0.3", "abd", false, false},
+		{"older tag is not a downgrade", "v0.0.2", sha, "v0.0.3", strings.Repeat("b", 40), false, false},
+		{"dev running build is refused", "v0.0.3", sha, "dev", "none", false, true},
+		{"unparsable tag is refused", "nope", sha, "v0.0.3", sha, false, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ShouldUpdate(tt.latestTag, tt.latestCommit, tt.curTag, tt.curCommit)
+			if (err != nil) != tt.wantErr || got != tt.want {
+				t.Fatalf("got %v, %v; want %v, wantErr %v", got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLatestResolvesCommit checks the tag is resolved to a commit when the API is the standard
+// release endpoint, and that the lookup is simply skipped for any other shape.
+func TestLatestResolvesCommit(t *testing.T) {
+	const sha = "c04bfca9d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6"
+
+	tests := []struct {
+		name       string
+		commitCode int
+		want       string
+	}{
+		{"resolved", http.StatusOK, sha},
+		{"lookup fails, tag only", http.StatusNotFound, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			srv := httptest.NewServer(mux)
+			defer srv.Close()
+
+			mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, _ *http.Request) {
+				fmt.Fprint(w, `{"tag_name":"v0.2.0","assets":[]}`)
+			})
+			mux.HandleFunc("/commits/v0.2.0", func(w http.ResponseWriter, _ *http.Request) {
+				if tt.commitCode != http.StatusOK {
+					w.WriteHeader(tt.commitCode)
+					return
+				}
+
+				fmt.Fprintf(w, `{"sha":%q}`, sha)
+			})
+
+			rel, err := Client{API: srv.URL + "/releases/latest"}.Latest(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if rel.Tag != "v0.2.0" || rel.Commit != tt.want {
+				t.Fatalf("tag, commit = %q, %q; want v0.2.0, %q", rel.Tag, rel.Commit, tt.want)
+			}
+		})
+	}
+}
+
+// TestLatestCustomAPISkipsCommit checks a non-standard endpoint is not second-guessed into a
+// commit lookup, so a mirror or a test server needs only to serve the release payload.
+func TestLatestCustomAPISkipsCommit(t *testing.T) {
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	mux.HandleFunc("/latest", func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, `{"tag_name":"v0.2.0","assets":[]}`)
+	})
+	mux.HandleFunc("/commits/v0.2.0", func(w http.ResponseWriter, _ *http.Request) {
+		t.Error("commit lookup must not run for a custom API")
+	})
+
+	rel, err := Client{API: srv.URL + "/latest"}.Latest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if rel.Commit != "" {
+		t.Fatalf("commit = %q, want empty", rel.Commit)
+	}
+}
+
 func TestAssetName(t *testing.T) {
 	tests := []struct {
 		goos, goarch, want string
@@ -237,5 +340,30 @@ func TestLatestErrors(t *testing.T) {
 				t.Fatalf("err = %v, want containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// TestMoveAside checks a successful rename is reported as success, with and without a stale
+// .old from a previous update: wrapping a nil error made every Windows replacement fail.
+func TestMoveAside(t *testing.T) {
+	exe := filepath.Join(t.TempDir(), "proxy-over-smtp")
+	if err := os.WriteFile(exe, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := moveAside(exe); err != nil {
+		t.Fatalf("first moveAside = %v, want nil", err)
+	}
+
+	if _, err := os.Stat(exe + oldSuffix); err != nil {
+		t.Fatalf("stat %s: %v", exe+oldSuffix, err)
+	}
+
+	if err := os.WriteFile(exe, []byte("bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := moveAside(exe); err != nil {
+		t.Fatalf("moveAside with a stale %s = %v, want nil", oldSuffix, err)
 	}
 }

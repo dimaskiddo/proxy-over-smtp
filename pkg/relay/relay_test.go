@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 )
@@ -103,6 +104,85 @@ func TestPipe(t *testing.T) {
 				t.Fatal("b1 still open")
 			}
 		})
+	}
+}
+
+// TestPipeCount checks each direction is reported separately and matches the bytes the peer
+// actually received, because a caller logs those numbers as transfer sizes.
+func TestPipeCount(t *testing.T) {
+	a1, a2 := net.Pipe()
+	b1, b2 := net.Pipe()
+	defer a1.Close()
+	defer b2.Close()
+
+	up := make([]byte, 5*bufferSize+1)
+	down := make([]byte, 2*bufferSize+13)
+
+	for _, p := range [][]byte{up, down} {
+		if _, err := rand.Read(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type result struct {
+		up, down int64
+	}
+
+	done := make(chan result, 1)
+	go func() {
+		u, d := PipeCount(a2, b1)
+		done <- result{u, d}
+	}()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	// a1 writes the up direction, b2 writes the down direction, both at once.
+	go func() {
+		defer wg.Done()
+
+		if _, err := a1.Write(up); err != nil {
+			t.Errorf("write up: %v", err)
+		}
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		if _, err := b2.Write(down); err != nil {
+			t.Errorf("write down: %v", err)
+		}
+	}()
+
+	gotUp := make([]byte, len(up))
+	if _, err := io.ReadFull(b2, gotUp); err != nil {
+		t.Fatal(err)
+	}
+
+	gotDown := make([]byte, len(down))
+	if _, err := io.ReadFull(a1, gotDown); err != nil {
+		t.Fatal(err)
+	}
+
+	wg.Wait()
+
+	if !bytes.Equal(gotUp, up) {
+		t.Fatal("up payload corrupted")
+	}
+
+	if !bytes.Equal(gotDown, down) {
+		t.Fatal("down payload corrupted")
+	}
+
+	a1.Close()
+
+	select {
+	case r := <-done:
+		if r.up != int64(len(up)) || r.down != int64(len(down)) {
+			t.Fatalf("up, down = %d, %d; want %d, %d", r.up, r.down, len(up), len(down))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PipeCount did not return after close")
 	}
 }
 

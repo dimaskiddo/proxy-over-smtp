@@ -147,6 +147,12 @@ proxy-over-smtp <command> [flags]
   version   Print version information (also --version)
 ```
 
+`version` prints one line, the release tag and the commit it was built from:
+
+```
+Proxy-Over-SMTP v0.5.0~c04bfca
+```
+
 Server and client use the same binary and the same secret. Every flag can also be set through an environment variable named `PROXY_OVER_SMTP_` plus the flag name in upper case with `-` as `_`. Precedence: flag, then env, then default.
 
 | Flag | Env | Default | Commands | Purpose |
@@ -155,7 +161,9 @@ Server and client use the same binary and the same secret. Every flag can also b
 | `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address the client dials |
 | `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Shared secret: handshake authentication and stream key master. Prefer the env var |
 | `--cipher` | `PROXY_OVER_SMTP_CIPHER` | `aes` | server, client | Stream cipher: `xor` or `aes`. Both ends must match |
-| `--max-streams` | `PROXY_OVER_SMTP_MAX_STREAMS` | `128` | server, client | Max concurrent streams per session. Enforced by the server; a client value is accepted but ignored |
+| `--max-streams` | `PROXY_OVER_SMTP_MAX_STREAMS` | `128` | server, client | Max concurrent streams per session. Enforced by the server; on the client it is the per-session load at which the pool grows |
+| `--pool-min` | `PROXY_OVER_SMTP_POOL_MIN` | `2` | client | Floor the client's session pool shrinks back to. The pool dials on demand, so it never starts here. Client-only |
+| `--pool-max` | `PROXY_OVER_SMTP_POOL_MAX` | `8` | client | Max tunnel sessions the client opens under load. Both must satisfy `1 <= min <= max <= 16` |
 | `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback, private and link-local targets (blocked by default) |
 | `--tls-cert` | `PROXY_OVER_SMTP_TLS_CERT` | empty | client | PEM certificate. With `--tls-key`, enables the HTTPS (TLS) proxy listener |
 | `--tls-key` | `PROXY_OVER_SMTP_TLS_KEY` | empty | client | PEM private key for `--tls-cert`. Both or neither |
@@ -169,6 +177,18 @@ Server and client use the same binary and the same secret. Every flag can also b
 `--update-api` (`PROXY_OVER_SMTP_UPDATE_API`) is hidden: it overrides the release endpoint for tests and mirrors. It is trusted for both the archive and its checksum, so point it only at a source you control.
 
 `--listen` and `--remote` must be `host:port`; a malformed value is rejected at startup instead of at bind time.
+
+### 🧵 Session pool
+
+The client runs several tunnel sessions, not one. Each local connection is pinned to a session for its whole life, and a new session is dialed once every open one is loaded, up to `--pool-max`. Idle sessions are released back down to `--pool-min`.
+
+This raises **aggregate** throughput: N sessions cost N TCP connections and give roughly N times the ceiling of one. It does not raise the speed of a single TCP flow, which still rides one session and is still capped by `window / RTT`. Browsers and download managers open many connections, so a pool is what a fast link actually uses. Rule of thumb: sessions ≈ target Gbps ÷ 1.3, capped at 16.
+
+```sh
+proxy-over-smtp client --remote host:465 --pool-min 2 --pool-max 8
+```
+
+The server needs no matching flag. One client holding N sessions is N connections to it, and each session is capped by `--max-streams` as usual, so N clients at `--pool-max 8` can present up to 8N session handlers.
 
 ### 🧭 Using the proxy
 
@@ -205,18 +225,24 @@ Notes:
 ### 🔄 Updating
 
 ```sh
+proxy-over-smtp version          # Proxy-Over-SMTP v0.5.0~c04bfca
 proxy-over-smtp update --check   # Print current and latest version only
 proxy-over-smtp update           # Download, verify and replace this binary
 proxy-over-smtp update --force   # Reinstall even if up to date, or from a dev build
 ```
 
+The version line is the release tag plus the commit the binary was built from (`~` separates them). A build with no known commit prints the tag alone, and a source build prints `Proxy-Over-SMTP dev`.
+
 `update` replaces the binary on disk. Running instances keep the old code until restarted.
 
 With `--auto-update`, a running `server` or `client` checks at start and then every `--update-interval`. On a newer release it swaps the binary, drains connections and re-executes itself with the same arguments (same PID on Unix). Dev builds never auto-update.
 
+A newer tag is not the only trigger: when the tag is unchanged but the commit differs, `update` reinstalls and auto-update restarts. That covers a release that was re-tagged or rebuilt in place, where the version string alone would look identical. The comparison needs both commits known, so it is skipped when either side is unknown or the running build is dirty.
+
 Notes:
 
 - Downloads are verified against the release `checksums.txt` (sha256). That proves integrity, not authenticity: releases are not signed.
+- The commit comparison is unordered: a tag that moves backwards counts as different too, so a re-tag can cause one reinstall per `--update-interval` until it settles. `update --check` shows both sides before anything is replaced.
 - Auto-update can leave server and client on different versions. If a release changes the wire protocol, old and new do not interoperate. Update the server first, then clients.
 - Docker: the swap lives in the container layer and a container restart reverts it. Pull a new image instead.
 - Windows: the re-executed process is a child, so it detaches from a service manager. Prefer manual `update` plus a restart there.
@@ -229,9 +255,12 @@ Logs are an event stream on stdout. Redirect or collect them with your process m
 ```
 time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113.5:56810 target=example.com:443 proto=socks5
 time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" target=10.0.0.1:80 err="dial tcp 10.0.0.1:80: target address not allowed"
+time=2026-10-07T17:10:33.514+07:00 level=INFO msg="connection closed" peer=127.0.0.1:49822 up=1048576 down=0 dur=1.204s
 ```
 
-`--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged; the target host and port are, as the audit trail, so treat the log stream as sensitive when it leaves the host.
+The first two lines are the server; the third is the client. `tunnel opened` and `connection closed` are the two audit lines: the server names the destination, the client names the local application that used the proxy and how much it moved. The client does not parse the request, so its line never contains a target — the destination stays on the server, and a client's log can leave the host without carrying browsing destinations.
+
+`--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged, on either side.
 
 ---
 
@@ -256,9 +285,24 @@ Measured on a Ryzen 5 PRO 4650U, 200MB transfer through the client on one host:
 |---|---|
 | Tunnel, `--cipher aes`, 1 stream | ~139 MB/s (~1.1 Gbps) |
 | Tunnel, `--cipher xor`, 1 stream | ~133 MB/s |
-| Tunnel ceiling, aggregate | ~161 MB/s (~1.3 Gbps) |
+| Tunnel ceiling, single session (aggregate) | ~161 MB/s (~1.3 Gbps) |
+| 8 streams on one session, `aes` / `xor` | ~80 MB/s / ~125 MB/s |
+| 8 streams over two pooled sessions, `aes` / `xor` | ~130 MB/s / ~190 MB/s |
 
 Both ciphers land in the same place end to end: AES has hardware GCM, and XOR's read path is zero-copy, so the cost is dominated by syscalls and scheduling rather than crypto. `--cipher aes` stays the default.
+
+The last two rows are from `make bench` on loopback, where RTT is near zero. Spreading eight streams over two sessions beats putting all eight on one by 1.5x to 2x in a given run, because the ceiling there is one core's syscall and scheduling cost rather than a window: the pool buys CPU parallelism on one host, and window/RTT on a real link. The absolute rates swing run to run on a shared machine, so compare rows within one run, not across runs. Either way, one session's ceiling is not a wall for a whole client.
+
+Aggregate through the proxy on the same host, each transfer capped so the cap - not the link - sets the demand:
+
+| Demand | Sessions used | Aggregate |
+|---|---|---|
+| 1 transfer, `--limit-rate 100M` | 1 | 105 MB/s (`aes` 99% of direct, `xor` 100%) |
+| 4 transfers, `--limit-rate 100M` (400M) | 1 | 172 MB/s |
+| 20 transfers, `--limit-rate 25M` (500M) | 2 | 190 MB/s |
+| 40 transfers, `--limit-rate 15M` (600M) | 3 | 209 MB/s |
+
+The first row is a single flow and the pool cannot help it: it is one stream on one session. The rows after it pass the ~161 MB/s single-session ceiling and keep climbing as sessions are added, which is what the pool is for. They flatten quickly on this host because 40 curl processes, the origin server and both tunnel ends all share six cores; the per-session win is cleaner in `make bench`. The pool only opened those extra sessions because 16 or more streams were in flight at once: with `--max-streams 128` a slot is not considered loaded until it carries 16, so four parallel transfers stay on one session by design.
 
 **Checking it yourself.** `curl` can cap a transfer, so the cap, not the proxy, sets the target. Direct and proxied runs at the same cap should agree:
 
@@ -267,7 +311,7 @@ curl -o /dev/null --limit-rate 100M http://host/file                          # 
 curl -o /dev/null --limit-rate 100M -x socks5h://127.0.0.1:1080 http://host/file
 ```
 
-Measured that way on the same host: 99.8% (`aes`) and 99.7% (`xor`) at a 100M cap, 99.1% at 50M. At a 200M cap the absolute rate is ~136 MB/s, about 67% — past 1 Gbps the CPU ceiling is the limit, which is expected. `iperf3 -c host` through the client works too, and `iperf3 -P 8` shows the multi-stream behaviour. `make bench` prints the per-layer numbers above.
+For aggregate, run several capped transfers at once with `&` and add the reported rates, or use `iperf3 -P 8`. Watch the session count at `--log-level debug` (`session pool shrunk`) or from the server's connection count. `make bench` prints the per-layer numbers above.
 
 ---
 
@@ -281,7 +325,8 @@ Measured that way on the same host: 99.8% (`aes`) and 99.7% (`xor`) at a 100M ca
 ## 🧪 Testing
 
 ```sh
-go test ./...
+make test        # plain go test
+make test-race   # race detector; needs CGO, so it is a separate target
 ```
 
 ---

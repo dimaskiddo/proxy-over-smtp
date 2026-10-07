@@ -21,9 +21,9 @@ func TestReadRequest(t *testing.T) {
 		{"connect ipv6 default port", "CONNECT [2001:db8::1] HTTP/1.1\r\nHost: x\r\n\r\n", "[2001:db8::1]:443", nil, false},
 		{"absolute get", "GET http://example.com/a?b=1 HTTP/1.1\r\nHost: example.com\r\n\r\n", "example.com:80", nil, false},
 		{"absolute with port", "GET http://example.com:8080/ HTTP/1.1\r\nHost: example.com:8080\r\n\r\n", "example.com:8080", nil, false},
-		{"origin form", "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n", "", ErrNotProxy, false},
-		{"ftp scheme", "GET ftp://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n", "", ErrNotProxy, false},
-		{"https scheme absolute", "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", "", ErrNotProxy, false},
+		{"origin form", "GET /index.html HTTP/1.1\r\nHost: example.com\r\n\r\n", "", errNotProxy, false},
+		{"ftp scheme", "GET ftp://example.com/x HTTP/1.1\r\nHost: example.com\r\n\r\n", "", errNotProxy, false},
+		{"https scheme absolute", "GET https://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n", "", errNotProxy, false},
 		{"garbage", "NOT HTTP\r\n\r\n", "", nil, true},
 	}
 

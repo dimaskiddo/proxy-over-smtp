@@ -23,6 +23,15 @@ func TestValidate(t *testing.T) {
 		{"tls key only", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, TLSKey: "k"}, true},
 		{"max streams zero", Config{Listen: ":1", Secret: "s", Cipher: CipherAES}, true},
 		{"max streams negative", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: -1}, true},
+		{"pool unset is ok", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, false},
+		{"pool defaults ok", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: DefaultPoolMin, PoolMax: DefaultPoolMax}, false},
+		{"pool equal ok", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: 3, PoolMax: 3}, false},
+		{"pool at cap ok", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: 1, PoolMax: MaxPoolSize}, false},
+		{"pool min above max", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: 9, PoolMax: 8}, true},
+		{"pool min zero with max set", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMax: 8}, true},
+		{"pool max zero with min set", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: 2}, true},
+		{"pool min negative", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: -1, PoolMax: 8}, true},
+		{"pool max above cap", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, PoolMin: 2, PoolMax: MaxPoolSize + 1}, true},
 	}
 
 	for _, tt := range tests {

@@ -19,17 +19,19 @@ const maxRecord = 16 << 10
 // hdrLen is the big-endian record length prefix that precedes every sealed record.
 const hdrLen = 4
 
-// Errors returned by Read when a peer's records cannot be processed.
+// Errors returned by Read when a peer's records cannot be processed. They stay unexported
+// because the tunnel treats every read failure the same way: the stream is torn down and the
+// connection is dropped, so no caller branches on which one fired.
 var (
-	// ErrRecordTooLarge is returned when a peer announces a record over the wire limit.
-	ErrRecordTooLarge = errors.New("aesstream: record too large")
+	// errRecordTooLarge is returned when a peer announces a record over the wire limit.
+	errRecordTooLarge = errors.New("aesstream: record too large")
 
-	// ErrAuth is returned when a record fails GCM authentication: tampering, a wrong key or a
+	// errAuth is returned when a record fails GCM authentication: tampering, a wrong key or a
 	// lost stream position all look the same.
-	ErrAuth = errors.New("aesstream: authentication failed")
+	errAuth = errors.New("aesstream: authentication failed")
 
-	// ErrShortRecord is returned when the connection ends inside a record.
-	ErrShortRecord = errors.New("aesstream: truncated record")
+	// errShortRecord is returned when the connection ends inside a record.
+	errShortRecord = errors.New("aesstream: truncated record")
 )
 
 // Stream encrypts everything written and decrypts everything read with AES-256-GCM. Each
@@ -126,7 +128,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 
 	size := binary.BigEndian.Uint32(hdr[:])
 	if size < uint32(s.open.Overhead()) || size > maxRecord+uint32(s.open.Overhead()) {
-		return 0, ErrRecordTooLarge
+		return 0, errRecordTooLarge
 	}
 
 	if cap(s.rbuf) < int(size) {
@@ -136,7 +138,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 	rec := s.rbuf[:size]
 	if _, err := io.ReadFull(s.inner, rec); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return 0, ErrShortRecord
+			return 0, errShortRecord
 		}
 
 		return 0, err
@@ -145,7 +147,7 @@ func (s *Stream) Read(p []byte) (int, error) {
 	// GCM opens in place here: the output starts at the same address as the ciphertext.
 	plain, err := s.open.Open(rec[:0], setNonce(s.rnb, s.rseq), rec, nil)
 	if err != nil {
-		return 0, ErrAuth
+		return 0, errAuth
 	}
 
 	s.rseq++

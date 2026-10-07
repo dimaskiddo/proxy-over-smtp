@@ -121,7 +121,8 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 
 		mu.Lock()
 		open++
-		over := open > t.cfg.MaxStreams
+		peak := open
+		over := peak > t.cfg.MaxStreams
 		mu.Unlock()
 
 		// Refuse over the cap instead of queueing, so one peer cannot hold unbounded handlers.
@@ -130,7 +131,9 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 			open--
 			mu.Unlock()
 
-			t.log.Debug("stream refused", "peer", peer.String(), "open", open, "max", t.cfg.MaxStreams)
+			// peak is captured under the lock: the refused stream is off the count by now, and a
+			// handler finishing meanwhile must not change what the refusal reports.
+			t.log.Debug("stream refused", "peer", peer.String(), "open", peak, "max", t.cfg.MaxStreams)
 			vs.Close()
 			continue
 		}

@@ -1,8 +1,7 @@
 BUILD_CGO_ENABLED  := 0
 VERSION            ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT             ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
-DATE               ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-LDFLAGS            := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
+LDFLAGS            := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT)
 SERVICE_NAME       := proxy-over-smtp
 REBASE_URL         := "github.com/dimaskiddo/proxy-over-smtp"
 COMMIT_MSG         := "update improvement"
@@ -45,7 +44,10 @@ run:
 	go run ./cmd/proxy-over-smtp $(ARGS)
 
 test:
-	go test -count=1 ./...
+	CGO_ENABLED=0 go test -count=1 ./...
+
+test-race:
+	CGO_ENABLED=1 go test -race -count=1 ./...
 
 bench:
 	CGO_ENABLED=0 go test -run xxx -bench . -benchtime 10s ./pkg/relay/ ./pkg/aesstream/ ./pkg/xorstream/ ./internal/tunnel/

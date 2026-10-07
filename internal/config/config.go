@@ -19,6 +19,19 @@ const (
 // single authenticated peer can hold in stream handlers.
 const DefaultMaxStreams = 128
 
+// Session pool bounds. The pool is client-only: the server accepts the values and ignores them.
+const (
+	// DefaultPoolMin is the floor the client's pool shrinks back to once its sessions go idle. The
+	// pool dials on demand rather than up front, so this is a floor, never a starting count.
+	DefaultPoolMin = 2
+	// DefaultPoolMax is how far the pool may grow under load. Eight sessions clear multi-gigabit
+	// aggregate throughput on a link where one session is CPU-bound near 1.3 Gbps.
+	DefaultPoolMax = 8
+	// MaxPoolSize bounds --pool-max. Each session costs a TCP connection, a handshake and a 16MB
+	// receive buffer on both ends, so the cap keeps a typo from exhausting memory.
+	MaxPoolSize = 16
+)
+
 // Config is the tunnel configuration collected from flags and environment variables.
 type Config struct {
 	// Listen is the address the server or client accepts connections on.
@@ -32,9 +45,14 @@ type Config struct {
 	Cipher string
 	// AllowPrivate lets the server dial loopback, private and link-local targets.
 	AllowPrivate bool
-	// MaxStreams caps concurrent streams per session. The server enforces it; a client value
-	// is accepted for symmetry but ignored.
+	// MaxStreams caps concurrent streams per session. The server enforces it; the client reads it
+	// as the per-session load at which its pool grows another session.
 	MaxStreams int
+	// PoolMin and PoolMax bound the client's session pool: the floor its shrink stops at, and how
+	// far it may grow under load. Both zero means unset, which the client replaces with the
+	// defaults. The server carries the values and ignores them.
+	PoolMin int
+	PoolMax int
 	// TLSCert and TLSKey are PEM files that enable a TLS proxy listener on the client.
 	// Both or neither must be set.
 	TLSCert string
@@ -53,6 +71,18 @@ func (c Config) Validate() error {
 
 	if c.MaxStreams <= 0 {
 		return errors.New("max-streams must be greater than zero")
+	}
+
+	// Both zero means the pool was never configured, which is the normal server case. A value on
+	// either side means the caller meant it, so a zero on the other side is a mistake, not a gap.
+	if c.PoolMin != 0 || c.PoolMax != 0 {
+		if c.PoolMin < 1 || c.PoolMax > MaxPoolSize {
+			return fmt.Errorf("pool sizes must be between 1 and %d", MaxPoolSize)
+		}
+
+		if c.PoolMin > c.PoolMax {
+			return errors.New("pool-min must not exceed pool-max")
+		}
 	}
 
 	if c.Listen == "" {

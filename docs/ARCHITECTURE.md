@@ -15,7 +15,7 @@ graph LR
     subgraph internal["internal/"]
         Cli["cli/<br/>root.go env.go log.go<br/>update.go version.go"]
         Config["config/"]
-        Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go mux.go socket*.go"]
+        Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go pool.go handshake.go<br/>cipher.go mux.go socket*.go"]
         Update["update/<br/>update.go replace.go<br/>restart_*.go"]
     end
 
@@ -61,7 +61,7 @@ sequenceDiagram
     participant T as Target
 
     App->>C: TCP connect (:1080), optional TLS
-    C->>S: dial (once, reused) + SMTP handshake
+    C->>S: dial (pooled session) + SMTP handshake
     C->>S: smux stream open
     App->>C: proxy bytes (SOCKS4/5 or HTTP)
     C->>S: raw bytes via stream
@@ -76,7 +76,10 @@ sequenceDiagram
 |---|---|---|
 | **Entry** | `cmd/proxy-over-smtp/` | Signal context, build info (ldflags), call `cli.Execute` |
 | **CLI** | `internal/cli/` | Cobra commands (`server`, `client`, `version`, `update`), env-to-flag fallback, `slog` logger, graceful drain |
-| **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, TLS config, connection `WaitGroup`, active counter, hard-stop context, shared client session. `Shutdown` drains |
+| **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, TLS config, connection `WaitGroup`, active counter, hard-stop context, client session pool. `Shutdown` drains |
+| **Pool** | `internal/tunnel/pool.go` | Client-only: the slots, pick/grow/shrink, per-stream reservation. See §1.1 |
+| **Handshake** | `internal/tunnel/handshake.go` | Challenge-response over the fake SMTP session, key derivation, capped line reads |
+| **Cipher** | `internal/tunnel/cipher.go` | Picks the XOR or AES stream wrapper for a session |
 | **Client** | `internal/tunnel/client.go` | Local listener. Does **not** parse proxy protocols: pipes raw local bytes into a new smux stream, so the server answers the handshake. Only exception: terminates TLS when `--tls-cert`/`--tls-key` are set and the first byte is a TLS ClientHello |
 | **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream protocol detection + negotiation + dial + relay |
 | **Update** | `internal/update/` | Release lookup, verified download, self-replace, re-exec |
@@ -88,6 +91,22 @@ sequenceDiagram
 | **Relay** | `pkg/relay/` | Bidirectional copy |
 | **XOR Stream** | `pkg/xorstream/` | Rolling-key XOR wrapper over `io.ReadWriter` (obfuscation only) |
 | **AES Stream** | `pkg/aesstream/` | AES-256-GCM record wrapper over `io.ReadWriter` (confidentiality and integrity) |
+
+### 1.1 Session pool (`internal/tunnel/pool.go`)
+
+One smux session per client caps a whole client at one TCP connection's worth of throughput. The client therefore keeps a pool of them, bounded by `--pool-min` (default 2) and `--pool-max` (default 8). The server is unchanged: it sees N connections instead of one, and each is capped by `--max-streams` as before.
+
+A `slot` is one session plus its load counter, its single-dial gate and the time it last went idle. The rules:
+
+- **Pick.** A local connection takes the healthy slot carrying the fewest streams, so load spreads instead of piling onto whichever session dialed first.
+- **Reserve.** The pick increments the slot's stream counter while holding the pool lock. The reservation is what makes a slot being handed out immune to the shrink scan, and it is given back if the stream fails to open. That is the one piece of shared state the stream path cannot do without.
+- **Grow.** Growth needs *all* slots loaded, not just the picked one: a slot counts as loaded at `max(4, MaxStreams/8)` streams. With `--max-streams 128` that is 16 streams, so a pool of two only opens a third session under real concurrency. Growth is single-flight per slot: while a dial runs, other callers wait on that slot's `dialing` channel and then take the least loaded slot, so a burst opens one extra TCP connection rather than one each.
+- **Shrink.** There is no timer. A slot that drops to zero streams records when, and the *next* stream close scans for slots idle for 60s and closes them down to `--pool-min`. A pool therefore only releases a session because real traffic ended.
+- **Eviction.** A peer restart leaves a session that `IsClosed` still reports as open until keepalive times out, so a failed `OpenStream` removes that slot and the open retries on another. `openStream` also prunes closed slots on every pick, which covers the common case where the death is already visible.
+
+Every session runs its own handshake and derives its own directional keys from its own nonce. Keys are never shared between slots.
+
+Both count ceilings are honest ones: the pool multiplies *aggregate* throughput, and a single TCP flow still rides a single session, capped by `window / RTT` and by one session's CPU cost. Raising `--pool-max` past what the uplink or the peer can carry just adds idle connections.
 
 ---
 
@@ -156,9 +175,9 @@ A single smux stream can never exceed `window / RTT`, with the window fixed at `
 | 50 ms | ~82 Mbps |
 | 100 ms | ~41 Mbps |
 
-A session aggregates its streams, bounded by `MaxReceiveBuffer` = 16MB, so one client reaches `16MB / RTT` once enough streams are open: 800 Mbps needs 4 streams at 20ms RTT, 10 at 50ms and 20 at 100ms, all under the `--max-streams` default of 128. Above ~100ms RTT a single session cannot hold 800 Mbps at all.
+A session aggregates its streams, bounded by `MaxReceiveBuffer` = 16MB, so one session reaches `16MB / RTT` once enough streams are open: 800 Mbps needs 4 streams at 20ms RTT, 10 at 50ms and 20 at 100ms, all under the `--max-streams` default of 128. Above ~100ms RTT a single session cannot hold 800 Mbps at all. Past that the pool (§1.1) adds more sessions, each with its own 16MB receive buffer, so the client aggregate is `pool × 16MB / RTT`.
 
-What is left after the window is CPU: measured same-host at ~139 MB/s for AES and ~133 MB/s for XOR, with an aggregate ceiling near 161 MB/s. A live CPU profile of a 3GiB transfer shows `Syscall6` 55% and `futex` 14% against 6% in GCM, so the limit is syscalls and goroutine scheduling, not the cipher. Both ciphers land in the same place end to end: AES has hardware GCM, and XOR's key application is cheap, but neither dominates the syscall cost. A faster host raises the CPU ceiling; the `window / RTT` ceiling moves only with RTT.
+What is left after the window is CPU: measured same-host at ~139 MB/s for AES and ~133 MB/s for XOR, with an aggregate ceiling near 161 MB/s for one session. A live CPU profile of a 3GiB transfer shows `Syscall6` 55% and `futex` 14% against 6% in GCM, so the limit is syscalls and goroutine scheduling, not the cipher. Both ciphers land in the same place end to end: AES has hardware GCM, and XOR's key application is cheap, but neither dominates the syscall cost. A faster host raises the CPU ceiling; the `window / RTT` ceiling moves only with RTT. Spreading streams over more sessions raises the CPU ceiling too, because each session is drained by its own goroutines: in `BenchmarkProxyThroughput` eight streams over two pooled sessions run 1.5x to 2x the same eight streams on one, for both ciphers. Absolute rates swing run to run on a shared machine, so compare the pooled and unpooled cases within a single run.
 
 The socket buffers stay under kernel autotuning for the same reason: a fixed buffer would cap a single flow no matter how many streams are open. See [Socket options](#5-socket-options). `make bench` reports the per-layer numbers above; the guarantee is documented, not enforced by a CI gate, because shared runners are too noisy to assert throughput on.
 
@@ -256,7 +275,9 @@ Precedence: command-line flag, then environment variable, then default. The env 
 | `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address dialed by client |
 | `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Handshake authentication and stream key master. Prefer the env var: argv is visible in `ps` |
 | `--cipher` | `PROXY_OVER_SMTP_CIPHER` | `aes` | server, client | `xor` or `aes`. Both ends must match |
-| `--max-streams` | `PROXY_OVER_SMTP_MAX_STREAMS` | `128` | server, client | Max concurrent streams per session. Enforced server-side; a client value is accepted but ignored |
+| `--max-streams` | `PROXY_OVER_SMTP_MAX_STREAMS` | `128` | server, client | Max concurrent streams per session. Enforced server-side; on the client it sets when the pool grows (see §1.1) |
+| `--pool-min` | `PROXY_OVER_SMTP_POOL_MIN` | `2` | client | Floor the session pool shrinks to, never its starting count |
+| `--pool-max` | `PROXY_OVER_SMTP_POOL_MAX` | `8` | client | Ceiling on pooled sessions under load. `1 <= min <= max <= 16` |
 | `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback/private/link-local targets |
 | `--tls-cert` | `PROXY_OVER_SMTP_TLS_CERT` | empty | client | PEM certificate for the TLS proxy listener |
 | `--tls-key` | `PROXY_OVER_SMTP_TLS_KEY` | empty | client | PEM key. Must be set together with `--tls-cert` |
@@ -270,7 +291,9 @@ Precedence: command-line flag, then environment variable, then default. The env 
 
 `--listen` and `--remote` are checked for `host:port` shape at startup, so a malformed address fails immediately instead of at bind time. Names are not resolved during validation: a transient DNS failure must not stop startup.
 
-Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`, `proto` = `socks5`, `socks4`, `http`, `http-connect`), `draining` (`active`, `timeout`), `target unreachable` (warn), `shutdown complete`, `drain interrupted, connections closed` (warn). Handshake and protocol rejections log at debug. The secret is never logged. Target host names and ports are logged by design as the audit trail, so treat the log stream as sensitive when it leaves the host.
+Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`, `proto` = `socks5`, `socks4`, `http`, `http-connect`), `connection closed` on the client (`peer`, `up`, `down`, `dur`), `draining` (`active`, `timeout`), `target unreachable` (warn), `shutdown complete`, `drain interrupted, connections closed` (warn). Handshake and protocol rejections log at debug. The secret is never logged.
+
+`peer` means different things on each side, because each side sees a different hop. On the server it is the tunnel client's address plus `target` and `proto`. On the client it is the local application's address, and there is no `target`: the client pipes bytes without parsing the request, so the destination is only known to the server. Target host names and ports are logged by the server as the audit trail — one client-side line never reveals a destination — so treat a server's log stream as sensitive when it leaves the host.
 
 ---
 
@@ -279,14 +302,14 @@ Logging: `log/slog` with structured key/value fields, written to stdout as an ev
 - **Accept loop:** shared by both modes. Accept errors retry with 5ms–1s backoff. `spawn` and `Shutdown` share one lock, so a handler never starts after the drain began: a connection accepted in that window is closed instead of handled. `RunServer`/`RunClient` called after `Shutdown` return an error, and `Shutdown` itself is idempotent and safe before any Run.
 - **Per connection:** one goroutine tracked in `Tunnel.conns`. `context.AfterFunc` closes the connection on cancel and is released when the handler returns.
 - **Per smux stream (server):** one goroutine tracked in `Tunnel.conns`: 30s deadline for detection, negotiation, dial and reply, then relay. A session refuses streams beyond `--max-streams` at once (close, debug `stream refused`) instead of queueing them, bounding the handlers one peer can hold.
-- **Client session:** `Tunnel.sess` guarded by `sessMu`. One dial runs at a time: other callers wait on `Tunnel.dialing` and reuse its result, so a burst of local connections opens one TCP connection. The lock is never held across the dial, so an established session is never queued behind a slow one. A failed stream open drops the session and retries once on a fresh one; the session is cleared under the lock only while it is still the shared one.
+- **Client pool:** `Tunnel.slots` guarded by `poolMu`; each slot keeps its own dial gate, so growth is single-flight per slot and an established session is never queued behind a slow dial. `Tunnel.closed` makes a pick or a dial that races `closeSession` stop instead of opening a session nothing would close. Streams hold a reservation on their slot for life; see §1.1.
 - **Active counter:** `Tunnel.Active()` is an atomic count of tracked handlers, used for the `draining` log.
 
 ### Graceful drain
 
 1. `SIGINT`/`SIGTERM` cancels the run context. `RunServer`/`RunClient` only stop accepting and return. Existing connections are not touched.
 2. The CLI logs `draining` and calls `Tunnel.Shutdown(ctx)` with `--drain-timeout`. `Shutdown` waits for all tracked handlers.
-3. Server sessions refuse new streams once draining starts and close themselves when their last stream ends, so idle sessions close at once. The client keeps using its shared session for in-flight relays.
+3. Server sessions refuse new streams once draining starts and close themselves when their last stream ends, so idle sessions close at once. The client keeps using its pooled sessions for in-flight relays.
 4. When handlers finish, `Shutdown` cancels the internal hard context, closes sessions and returns nil: log `shutdown complete`.
 5. If the drain context expires, or a second signal arrives, the hard context is cancelled first. That closes every connection and session, and `Shutdown` returns the context error: warn `drain interrupted, connections closed`. A bounded grace (5s) then waits for handler goroutines to exit.
 
@@ -297,12 +320,13 @@ Auto-update restart takes the same path before re-exec.
 ## 9. Self-update (`internal/update/`)
 
 1. `Latest` reads the GitHub `releases/latest` JSON (`tag_name`, asset names and URLs). Hidden `--update-api` overrides the endpoint for tests and mirrors.
-2. `assetName` maps GOOS/GOARCH to the GoReleaser archive name `proxy-over-smtp_<ver>_<os>_<arch>.zip` (darwin→macos, 386→32-bit, amd64→64-bit, arm64→arm-64-bit). It is coupled to `.goreleaser.yml`: rename one, rename the other.
-3. `Apply` downloads the zip and `checksums.txt` (100MB cap each), requires a sha256 match, extracts the binary in memory. Both are held in memory while verified, so a run needs up to about 200MB transiently.
-4. `replace` writes a temp file beside the executable with the original mode, fsyncs, then renames over it (atomic on POSIX). On Windows the running exe is first renamed to `<exe>.old`; a stale `.old` that is no longer locked is removed and the rename retried once, so two consecutive updates both succeed.
-5. Auto-update (in `internal/cli/update.go`) sets `app.restart` and cancels the run context, so the normal drain runs. `main` then calls `update.Restart()`: `syscall.Exec` on Unix (same PID, symlinks resolved so the replaced file is the one that runs), a child process plus exit on Windows.
+2. When `--update-api` ends in `/releases/latest`, that suffix is trimmed to form the repository base and the tag is resolved to a commit with `GET {base}/commits/{tag}` (GitHub dereferences an annotated tag there, so one request is enough). Any other API shape skips the lookup. A failed or unparsable lookup leaves `Release.Commit` empty, which means "unknown" and degrades the check to tag-only — a failed lookup is never an error.
+3. `assetName` maps GOOS/GOARCH to the GoReleaser archive name `proxy-over-smtp_<ver>_<os>_<arch>.zip` (darwin→macos, 386→32-bit, amd64→64-bit, arm64→arm-64-bit). It is coupled to `.goreleaser.yml`: rename one, rename the other.
+4. `Apply` downloads the zip and `checksums.txt` (100MB cap each), requires a sha256 match, extracts the binary in memory. Both are held in memory while verified, so a run needs up to about 200MB transiently.
+5. `replace` writes a temp file beside the executable with the original mode, fsyncs, then renames over it (atomic on POSIX). On Windows the running exe is first renamed to `<exe>.old`; a stale `.old` that is no longer locked is removed and the rename retried once, so two consecutive updates both succeed.
+6. Auto-update (in `internal/cli/update.go`) sets `app.restart` and cancels the run context, so the normal drain runs. `main` then calls `update.Restart()`: `syscall.Exec` on Unix (same PID, symlinks resolved so the replaced file is the one that runs), a child process plus exit on Windows.
 
-`Newer` compares `X.Y.Z` only and ignores any `-pre`/`+meta` suffix. `dev` builds never auto-update and need `--force` for manual update. The checksum comes from the same release as the archive, so it proves integrity, not authenticity: there is no signing.
+`Newer` compares `X.Y.Z` only and ignores any `-pre`/`+meta` suffix. It is left unchanged; the decision the callers use is `ShouldUpdate`, which adds one case on top: equal `X.Y.Z` from a different commit. The commit branch fires only when both values are known (neither empty nor the linker's `none`), neither version string carries `dirty`, and the two commit values differ under a case-insensitive common-prefix comparison with a 7-character floor (Git's own abbreviation floor, so a 40-character SHA and the same commit abbreviated to 7 compare as equal). An ambiguous pair — anything shorter than the floor — is treated as the same commit, so missing or abbreviated data can never drive a reinstall loop. The comparison is unordered on purpose: a tag that moves backwards reads as different, because that is what a re-tag is, and `--update-interval` bounds the consequence. `dev` builds never auto-update and need `--force` for manual update. The checksum comes from the same release as the archive, so it proves integrity, not authenticity: there is no signing.
 
 ---
 
@@ -310,12 +334,12 @@ Auto-update restart takes the same path before re-exec.
 
 1. **Fake SMTP handshake** — first bytes look like a mail session to naive DPI.
 2. **Cipher choice is explicit** — `--cipher aes` (the default) gives AES-256-GCM confidentiality and integrity; `--cipher xor` is obfuscation only. Neither protects the application-to-client hop unless `--tls-cert`/`--tls-key` are set. A cipher mismatch fails the handshake or the first record, like a wrong secret.
-3. **Single multiplexed session** — one TCP + handshake per client, many streams via smux. Lower latency, fewer connections.
+3. **Multiplexed sessions, pooled** — one TCP + handshake per session, many streams via smux, and the client keeps a small pool of sessions so aggregate throughput is not one connection's worth. Lower latency and fewer connections than one connection per local flow; a single flow still cannot exceed one session. See §1.1.
 4. **Protocols parsed server-side** — the client stays a dumb byte pipe, so detection on the server adds SOCKS4 and HTTP without changing the wire format. The only client-side parsing is the TLS ClientHello check, and only when a certificate is configured.
 5. **Reusable code in `pkg/`** — the XOR and AES streams, SOCKS4/5, HTTP proxy parsing and relay carry no app state. App wiring stays in `internal/`.
 6. **Stdlib first** — third-party dependencies are `xtaci/smux` (multiplexer), `spf13/cobra` (CLI) and `golang.org/x/sys` (per-OS socket option constants, which `syscall` lacks for `SO_REUSEPORT` on Linux). No viper: env fallback is a small pflag walker in `internal/cli/env.go`.
 7. **Target ACL on by default** — the server is an outbound proxy for anyone holding the secret, so non-public ranges are blocked unless `--allow-private`. The check runs after DNS resolution, on every candidate address, so an obfuscated literal or a rebinding name is still caught. Covered: loopback, private, link-local, multicast, unspecified, CGNAT `100.64.0.0/10`, the rest of `0.0.0.0/8`, `192.0.0.0/24` and reserved `240.0.0.0/4`. The rest of the documentation and benchmark space is not treated specially.
-8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64). Version, commit and date are injected via ldflags.
+8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64). Version and commit are injected via ldflags.
 9. **Twelve-factor** — config only from flags and env (no default secret), logs as a stdout event stream, stateless processes, port binding via `--listen`, graceful SIGTERM drain, `version` as an admin command.
 10. **smux v2 per-stream windows** — with v1 one unread stream fills the shared session buffer and stalls every stream. Limitation: smux has no half-close, so a client that only shuts down its write side (e.g. `nc -N`) loses the response.
 11. **Self-update from stdlib** — no update library; `net/http`, `archive/zip` and `crypto/sha256` cover it. Auto-update is opt-in because it can split server and client versions.

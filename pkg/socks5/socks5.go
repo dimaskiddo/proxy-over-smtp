@@ -10,16 +10,18 @@ import (
 	"net"
 )
 
-// Reply codes from RFC 1928.
+// Reply codes from RFC 1928. The server names the ones it maps from a dial outcome; the two
+// that only this package answers with stay unexported.
 const (
-	Succeeded            byte = 0x00
-	GeneralFailure       byte = 0x01
-	NotAllowed           byte = 0x02
-	NetworkUnreachable   byte = 0x03
-	HostUnreachable      byte = 0x04
-	ConnectionRefused    byte = 0x05
-	CommandNotSupported  byte = 0x07
-	AddrTypeNotSupported byte = 0x08
+	Succeeded          byte = 0x00
+	GeneralFailure     byte = 0x01
+	NotAllowed         byte = 0x02
+	NetworkUnreachable byte = 0x03
+	HostUnreachable    byte = 0x04
+	ConnectionRefused  byte = 0x05
+
+	commandNotSupported  byte = 0x07
+	addrTypeNotSupported byte = 0x08
 )
 
 // Protocol bytes from RFC 1928.
@@ -80,7 +82,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 	}
 
 	if req[1] != cmdCon {
-		_ = WriteReply(rw, CommandNotSupported, nil)
+		_ = WriteReply(rw, commandNotSupported, nil)
 		return "", fmt.Errorf("unsupported command %d", req[1])
 	}
 
@@ -121,7 +123,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 		host = string(name)
 
 	default:
-		_ = WriteReply(rw, AddrTypeNotSupported, nil)
+		_ = WriteReply(rw, addrTypeNotSupported, nil)
 		return "", fmt.Errorf("unsupported address type %d", req[3])
 	}
 

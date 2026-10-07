@@ -21,6 +21,13 @@ var bufferPool = sync.Pool{
 // Pipe copies both directions. When either direction ends it closes both ends and
 // returns only after both copies have exited.
 func Pipe(a, b io.ReadWriteCloser) {
+	PipeCount(a, b)
+}
+
+// PipeCount is Pipe that also reports the bytes copied in each direction: up is what b read
+// from a, down is what a read from b. A caller that logs transfer sizes uses this instead of
+// counting around Pipe.
+func PipeCount(a, b io.ReadWriteCloser) (up, down int64) {
 	var once sync.Once
 	closeBoth := func() {
 		once.Do(func() {
@@ -30,8 +37,9 @@ func Pipe(a, b io.ReadWriteCloser) {
 	}
 
 	var wg sync.WaitGroup
+	var n [2]int64
 
-	cp := func(dst io.Writer, src io.Reader) {
+	cp := func(i int, dst io.Writer, src io.Reader) {
 		defer wg.Done()
 		defer closeBoth()
 
@@ -39,12 +47,15 @@ func Pipe(a, b io.ReadWriteCloser) {
 		defer bufferPool.Put(bp)
 
 		// Wrapping hides WriterTo/ReaderFrom, which would bypass the pooled buffer.
-		_, _ = io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bp)
+		n[i], _ = io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bp)
 	}
 
 	wg.Add(2)
-	go cp(a, b)
-	go cp(b, a)
+	go cp(0, a, b)
+	go cp(1, b, a)
 
 	wg.Wait()
+
+	// n[0] is b to a, so it is the down direction; n[1] is a to b, the up direction.
+	return n[1], n[0]
 }

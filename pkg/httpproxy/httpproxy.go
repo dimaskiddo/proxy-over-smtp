@@ -12,9 +12,10 @@ import (
 	"strings"
 )
 
-// ErrNotProxy is returned when a request is not a proxy request, for example an origin-form
-// request aimed at the proxy itself or a scheme other than http.
-var ErrNotProxy = errors.New("not a proxy request")
+// errNotProxy marks a request that is not a proxy request: an origin-form request aimed at the
+// proxy itself, or a scheme other than http. It stays unexported because the caller answers
+// every parse failure with the same status.
+var errNotProxy = errors.New("not a proxy request")
 
 // hopByHop lists headers that apply to a single connection and must not reach the target.
 var hopByHop = []string{
@@ -32,14 +33,14 @@ func ReadRequest(br *bufio.Reader) (*http.Request, string, error) {
 
 	if req.Method == http.MethodConnect {
 		if req.URL.Host == "" {
-			return nil, "", ErrNotProxy
+			return nil, "", errNotProxy
 		}
 
 		return req, withPort(req.URL.Host, "443"), nil
 	}
 
 	if !req.URL.IsAbs() || req.URL.Scheme != "http" || req.URL.Host == "" {
-		return nil, "", ErrNotProxy
+		return nil, "", errNotProxy
 	}
 
 	return req, withPort(req.URL.Host, "80"), nil

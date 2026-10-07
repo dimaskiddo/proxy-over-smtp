@@ -1,10 +1,6 @@
 package cli
 
-import (
-	"fmt"
-	"runtime"
-	"runtime/debug"
-)
+import "runtime/debug"
 
 // BuildInfo is injected by the linker from cmd/proxy-over-smtp.
 type BuildInfo struct {
@@ -12,8 +8,6 @@ type BuildInfo struct {
 	Version string
 	// Commit is the short git revision, or "none".
 	Commit string
-	// Date is the build timestamp, or "unknown".
-	Date string
 }
 
 // resolved falls back to the module build info when the linker injected no version.
@@ -38,10 +32,11 @@ func (b BuildInfo) resolved() (version, commit string) {
 	return v, c
 }
 
-// String formats the build info as a single human-readable line.
+// String formats the build info as a single human-readable line, "name version" or
+// "name version~commit". The label itself comes from buildLabel, so the line and an update
+// message can never render the same build two different ways.
 func (b BuildInfo) String() string {
 	v, c := b.resolved()
 
-	return fmt.Sprintf("Proxy-Over-SMTP %s (commit %s, built %s, %s %s/%s)",
-		v, c, b.Date, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+	return "Proxy-Over-SMTP " + buildLabel(v, c)
 }

@@ -10,12 +10,11 @@ import (
 	"net"
 )
 
-// Reply codes from the SOCKS4 specification.
+// Reply codes from the SOCKS4 specification. WriteReply is the only writer, so they stay
+// unexported and callers pass a bool.
 const (
-	// Granted means the request was accepted.
-	Granted byte = 0x5A
-	// Rejected means the request was refused or failed.
-	Rejected byte = 0x5B
+	replyGranted  byte = 0x5A
+	replyRejected byte = 0x5B
 )
 
 // Protocol bytes from the SOCKS4 specification.
@@ -70,9 +69,9 @@ func ReadRequest(r *bufio.Reader) (string, error) {
 // WriteReply sends the 8-byte reply. The bound address is always zero because clients ignore
 // it for CONNECT.
 func WriteReply(w io.Writer, granted bool) error {
-	code := Rejected
+	code := replyRejected
 	if granted {
-		code = Granted
+		code = replyGranted
 	}
 
 	if _, err := w.Write([]byte{0x00, code, 0, 0, 0, 0, 0, 0}); err != nil {
