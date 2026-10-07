@@ -33,12 +33,12 @@ publish:
 
 build:
 	make vendor
-	CGO_ENABLED=$(BUILD_CGO_ENABLED) go build -ldflags="-s -w" -trimpath -a -o $(SERVICE_NAME) .
+	CGO_ENABLED=$(BUILD_CGO_ENABLED) go build -ldflags="-s -w" -trimpath -a -o $(SERVICE_NAME) ./cmd/proxy-over-smtp
 	echo "Build '$(SERVICE_NAME)' complete."
 
 run:
 	make vendor
-	go run *.go
+	go run ./cmd/proxy-over-smtp
 
 clean-dist:
 	rm -rf dist

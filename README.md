@@ -1,174 +1,177 @@
-# Proxy-Over-SMTP
+# 🔒 Proxy-Over-SMTP
 
-This tool will help you create a proxy service with an SMTP protocol implementation and XOR packets to confuse and disguise packets from Deep Packet Inspection (DPI) and recognize them as SMTP communications. This project is inspired by [smtp-tunnel-proxy](https://github.com/x011/smtp-tunnel-proxy)
+**Proxy-Over-SMTP** is a SOCKS5 proxy tunnel that disguises its traffic as an SMTP session and XOR-obfuscates the payload to confuse Deep Packet Inspection (DPI). This project is inspired by [smtp-tunnel-proxy](https://github.com/x011/smtp-tunnel-proxy).
 
-## Getting Started
+A **client** exposes a local SOCKS5 port. A **server** answers a fake SMTP handshake, then carries every proxied connection as a multiplexed stream inside a single TCP connection.
 
-These instructions will get you a copy of the project up and running on your local machine for development and testing purposes.
-See deployment section for notes on how to deploy the project on a live system.
+---
 
-### Prerequisites
+## ✨ Why Proxy-Over-SMTP?
 
-Prequisites packages:
-* Go (Go Programming Language)
-* GoReleaser (Go Automated Binaries Build)
-* Make (Automated Execution using Makefile)
+*   **🎭 SMTP Disguise:** Every connection opens with a plausible `220` / `EHLO` / `DATA` exchange before tunneling starts.
+*   **🧩 XOR Obfuscation:** Payload is XORed with a rolling key derived from your shared secret.
+*   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
+*   **🧦 Standard SOCKS5:** Works with browsers, `curl`, and anything that speaks SOCKS5 (IPv4, IPv6 and domain targets).
+*   **🛑 Graceful Shutdown:** Active connections drain on `SIGINT` / `SIGTERM` (5s limit).
+*   **📝 Audit Log:** Every tunnel (`peer -> target`) logged to stdout and file.
+*   **📦 Static Binaries:** `CGO_ENABLED=0` builds for Linux, macOS, and Windows, plus a Docker image.
 
-Optional packages:
-* Docker (Application Containerization)
+---
 
-### Deployment
+## 🏗️ Architecture at a Glance
 
-#### **Using Container**
-
-1) Install Docker CE based on the [manual documentation](https://docs.docker.com/desktop/)
-
-2) Run the following command on your Terminal or PowerShell for the server side
-```sh
-docker run -d \
-  -p <PROXY_SERVER_PORT>:<PROXY_SERVER_PORT>
-  --name proxy-over-smtp-server \
-  --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode server -server <PROXY_SERVER_PORT>
-
-# Example of Usage
-
-docker run -d \
-  -p 465:465
-  --name proxy-over-smtp-server \
-  --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
+```mermaid
+graph LR
+    App["Browser / curl<br/>(SOCKS5)"] --> Client["Client<br/>:1080"]
+    Client -- "fake SMTP handshake<br/>+ XOR + smux" --> Server["Server<br/>:465"]
+    Server -- "SOCKS5 negotiation<br/>per stream" --> Target["Target host"]
 ```
 
-3) Run the following command on your Terminal or PowerShell for the client side
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/WORKFLOWS.md](docs/WORKFLOWS.md) for details.
+
+---
+
+## 🚀 Getting Started
+
+### 📋 Prerequisites
+
+*   **Go** (1.25+)
+*   **Make** (For Builds)
+*   **GoReleaser** *(Optional, for mass binaries)*
+*   **Docker** *(Optional, for containers)*
+
+---
+
+## 🛠️ Deployment
+
+### 🐳 **Using Container**
+
+1.  **Install Docker** following the [official guide](https://docs.docker.com/desktop/).
+2.  **Run the server side:**
+    ```sh
+    docker run -d \
+      -p 465:465 \
+      --name proxy-over-smtp-server \
+      --rm dimaskiddo/proxy-over-smtp:latest \
+      proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
+    ```
+3.  **Run the client side:**
+    ```sh
+    docker run -d \
+      -p 1080:1080 \
+      --name proxy-over-smtp-client \
+      --rm dimaskiddo/proxy-over-smtp:latest \
+      proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+    ```
+4.  Point your browser to SOCKS version 5 at `127.0.0.1:1080` (or your client port).
+
+### 📦 **Using Pre-Built Binaries**
+
+1.  Download the latest release from the [Releases Page](https://github.com/dimaskiddo/proxy-over-smtp/releases) and extract it.
+2.  **Run server and client:**
+
+#### 🐧 **Linux / 🍎 macOS**
 ```sh
-docker run -d \
-  -p <CLIENT_PROXY_PORT>:<CLIENT_PROXY_PORT>
-  --name proxy-over-smtp-client \
-  --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
-
-# Example of Usage
-
-docker run -d \
-  -p 1080:1080
-  --name proxy-over-smtp-client \
-  --rm dimaskiddo/proxy-over-smtp:latest \
-  proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
-```
-
-4) Now open your favourite browser and set the Connection setting to use Proxy
-
-5) Set the proxy to use SOCKS version 5 protocol with address to 127.0.0.1 with port 1080 / Your Client Proxy Port
-
-#### **Using Pre-Build Binaries**
-
-1) Download Pre-Build Binaries from the [release page](https://github.com/dimaskiddo/proxy-over-smtp/releases)
-
-2) Extract the zipped file
-
-3) Run the pre-build binary for the server side
-```sh
-# MacOS / Linux
 chmod 755 proxy-over-smtp
-# -- Example of Usage
-# -- ./proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode server -server <PROXY_SERVER_PORT>
+
+# Server
 ./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
 
-# Windows
-# You can double click it or using PowerShell
-# -- Example of Usage
-# -- .\proxy-over-smtp.exe -secret <YOUR_SECRET_WORD> -mode server -server <PROXY_SERVER_PORT>
-.\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
+# Client
+./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
 ```
 
-4) Run the pre-build binary for the client side
-```sh
-# MacOS / Linux
-chmod 755 proxy-over-smtp
-# -- Example of Usage
-# -- ./proxy-over-smtp -secret <YOUR_SECRET_WORD> -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
-./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+#### 🪟 **Windows**
+*(Double click or use PowerShell)*
+```powershell
+# Server
+.\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
 
-# Windows
-# You can double click it or using PowerShell
-# -- Example of Usage
-# -- .\proxy-over-smtp.exe -secret <YOUR_SECRET_WORD> -mode client -client <CLIENT_PROXY_PORT> -remote <YOUR_SERVER_IP>:<PROXY_SERVER_PORT>
+# Client
 .\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
 ```
 
-5) Now open your favourite browser and set the Connection setting to use Proxy
+### 🏗️ **Build From Source**
 
-6) Set the proxy to use SOCKS version 5 protocol with address to 127.0.0.1 with port 1080 / Your Client Proxy Port
-
-#### **Build From Source**
-
-Below is the instructions to make this source code running:
-
-1) Create a Go Workspace directory and export it as the extended GOPATH directory
 ```sh
-cd <your_go_workspace_directory>
-export GOPATH=$GOPATH:"`pwd`"
+git clone -b master https://github.com/dimaskiddo/proxy-over-smtp.git
+cd proxy-over-smtp
+
+make vendor    # Pull vendor packages
+make run       # Run from source
+make build     # Build binary for this platform
+make release   # (Optional) Mass binaries via GoReleaser, output in dist/
 ```
 
-2) Under the Go Workspace directory create a source directory
+---
+
+## 🕹️ Usage
+
+Server and client use the same binary. The same `-secret` must be set on both sides.
+
+| Flag | Default | Purpose |
+|---|---|---|
+| `-mode` | `server` | `server` or `client` |
+| `-server` | `0.0.0.0:465` | Server listen address |
+| `-client` | `0.0.0.0:1080` | Client SOCKS5 listen address |
+| `-remote` | `127.0.0.1:465` | Server address the client dials |
+| `-secret` | `THIS_IS_YOUR_SECRET_WORD` | Shared secret (EHLO token and XOR key). Must not be empty. **Change it.** |
+| `-allow-private` | `false` | Server: allow targets in loopback, private and link-local ranges (blocked by default) |
+| `-log-file` | `./proxy-over-smtp.log` | Audit log path |
+
+Quick check through the client:
+
 ```sh
-mkdir -p src/github.com/dimaskiddo/proxy-over-smtp
+curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```
 
-3) Move to the created directory and pull codebase
+### 📁 Log Files
+
+Audit lines go to stdout and the `-log-file` file with an `AUDIT:` prefix, for example `Tunnel: <client-ip:port> -> <target:port>`, `Failed to Reach <target:port>: <error>`, `Shutdown Complete`.
+
+---
+
+## 📚 Documentation
+
+*   [Architecture](docs/ARCHITECTURE.md): module map, handshake, transport stack, design decisions.
+*   [Workflows](docs/WORKFLOWS.md): pipeline flows and error recovery.
+
+---
+
+## 🧪 Testing
+
 ```sh
-cd src/github.com/dimaskiddo/proxy-over-smtp
-git clone -b master https://github.com/dimaskiddo/proxy-over-smtp.git .
+go test ./...
 ```
 
-4) Run following command to pull vendor packages
-```sh
-make vendor
-```
+---
 
-5) Until this step you already can run this code by using this command
-```sh
-make run
-```
+## ✍️ Authors
 
-6) *(Optional)* Use following command to build this code into binary spesific platform
-```sh
-make build
-```
+*   **Dimas Restu Hidayanto** - *Initial Work* - [DimasKiddo](https://github.com/dimaskiddo)
 
-7) *(Optional)* To make mass binaries distribution you can use following command
-```sh
-make release
-```
+See also the list of [contributors](https://github.com/dimaskiddo/proxy-over-smtp/contributors) who participated in this project.
 
-### Running The Tests
+---
 
-Currently the test is not ready yet :)
+## 🏗️ Dependencies
 
-## Built With
+*   **[Go](https://golang.org/)**
+*   **[xtaci/smux](https://github.com/xtaci/smux)** - Stream multiplexer
+*   **[GoReleaser](https://github.com/goreleaser/goreleaser)** - Automated binaries build
+*   **[Make](https://www.gnu.org/software/make/)** - Automated execution
+*   **[Docker](https://www.docker.com/)** - Containerization
 
-* [Go](https://golang.org/) - Go Programming Languange
-* [GoReleaser](https://github.com/goreleaser/goreleaser) - Go Automated Binaries Build
-* [Make](https://www.gnu.org/software/make/) - GNU Make Automated Execution
-* [Docker](https://www.docker.com/) - Application Containerization
+---
 
-## Authors
+## ⚠️ Disclaimer
 
-* **Dimas Restu Hidayanto** - *Initial Work* - [DimasKiddo](https://github.com/dimaskiddo)
+**DO WITH YOUR OWN RISK (DWYR)**. This software is provided "as is", without warranty of any kind, express or implied. The authors are not responsible for any damage caused by the use of this application.
 
-See also the list of [contributors](https://github.com/dimaskiddo/proxy-over-smtp/contributors) who participated in this project
+**This is obfuscation, not encryption.** XOR hides patterns from naive DPI only. The secret is sent in plaintext in the `EHLO` line and there is no TLS. Do not rely on it for confidentiality.
 
-## Annotation
+---
 
-You can seek more information for the make command parameters in the [Makefile](https://github.com/dimaskiddo/proxy-over-smtp/-/raw/master/Makefile)
+## ⚖️ License
 
-## License
-
-Copyright (C) 2026 Dimas Restu Hidayanto
-
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Distributed under the **MIT License**. See [LICENSE](LICENSE) for more information.

@@ -1,5 +1,1 @@
-dist
-vendor
-.env
-**/.DS_Store
-**/.gitkeep
+.gitignore
