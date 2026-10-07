@@ -272,3 +272,6 @@ See also the list of [contributors](https://github.com/dimaskiddo/proxy-over-smt
 ## ⚖️ License
 
 Distributed under the **MIT License**. See [LICENSE](LICENSE) for more information.
+
+---
+**Proxy-Over-SMTP** — *Mail traffic on the wire, your proxy underneath.* 🔒📨

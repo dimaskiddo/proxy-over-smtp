@@ -20,11 +20,15 @@ import (
 )
 
 const (
+	// defaultTimeout bounds every pre-relay step: handshakes, proxy request parsing, dials and
+	// the TLS handshake. It never applies to an established relay.
 	defaultTimeout = 30 * time.Second
 
 	// forceWait bounds how long Shutdown waits for handlers after it closed their connections.
 	forceWait = 5 * time.Second
 
+	// minBackoff and maxBackoff bound the retry delay after a failed Accept, for example when
+	// the process runs out of file descriptors.
 	minBackoff = 5 * time.Millisecond
 	maxBackoff = time.Second
 )
@@ -36,6 +40,8 @@ type Tunnel struct {
 	log    *slog.Logger
 	tlsCfg *tls.Config
 
+	// conns tracks every handler so Shutdown can wait for them. active mirrors it because a
+	// WaitGroup cannot report its count.
 	conns  sync.WaitGroup
 	active atomic.Int64
 
@@ -43,6 +49,7 @@ type Tunnel struct {
 	hard       context.Context
 	hardCancel context.CancelFunc
 
+	// sess is the client's shared session, guarded by sessMu. A server never sets it.
 	sessMu sync.Mutex
 	sess   *smux.Session
 }
@@ -89,10 +96,14 @@ func (t *Tunnel) Shutdown(ctx context.Context) error {
 		err = ctx.Err()
 	}
 
+	// Also runs after a clean drain: it releases the AfterFunc registrations and closes
+	// sessions that are only idle.
 	t.hardCancel()
 	t.closeSession()
 
 	if err != nil {
+		// Give handlers a moment to notice their closed connections and exit before the
+		// caller ends the process.
 		select {
 		case <-done:
 		case <-time.After(forceWait):
@@ -151,6 +162,8 @@ func (t *Tunnel) acceptLoop(ctx context.Context, ln net.Listener, handle func(ne
 		backoff = minBackoff
 
 		t.spawn(func() {
+			// A forced drain closes the connection to unblock the handler. The returned stop
+			// func, called on return, unregisters it so finished handlers do not leak callbacks.
 			defer context.AfterFunc(t.hard, func() { conn.Close() })()
 			defer conn.Close()
 			handle(conn)

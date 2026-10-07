@@ -18,10 +18,12 @@ const (
 	Rejected byte = 0x5B
 )
 
+// Protocol bytes from the SOCKS4 specification.
 const (
 	version    = 0x04
 	cmdConnect = 0x01
-	maxField   = 255
+	// maxField caps the user ID and the SOCKS4a domain so a peer cannot stream bytes forever.
+	maxField = 255
 )
 
 // ReadRequest reads a CONNECT request and returns the target as host:port. The user ID is
@@ -48,6 +50,7 @@ func ReadRequest(r *bufio.Reader) (string, error) {
 	port := fmt.Sprint(binary.BigEndian.Uint16(head[2:4]))
 	ip := net.IP(head[4:8])
 
+	// 0.0.0.x with x != 0 is the SOCKS4a marker: the host name follows the user ID.
 	if head[4] == 0 && head[5] == 0 && head[6] == 0 && head[7] != 0 {
 		host, err := readCString(r)
 		if err != nil {
@@ -79,7 +82,8 @@ func WriteReply(w io.Writer, granted bool) error {
 	return nil
 }
 
-// readCString reads up to maxField bytes before a NUL so a peer cannot grow memory without bound.
+// readCString reads up to maxField bytes before a NUL, so a peer cannot grow memory without
+// bound.
 func readCString(r *bufio.Reader) (string, error) {
 	var buf []byte
 

@@ -16,8 +16,10 @@ import (
 )
 
 const (
+	// minUpdateInterval keeps a mistyped interval from exhausting the GitHub API rate limit.
 	minUpdateInterval = time.Hour
-	updateTimeout     = 2 * time.Minute
+	// updateTimeout bounds one release check plus one archive download.
+	updateTimeout = 2 * time.Minute
 )
 
 // errDevBuild is returned when update runs on a build without a release version.
@@ -27,7 +29,8 @@ var errDevBuild = errors.New("dev build has no comparable version: use --force")
 type updateOpts struct {
 	enabled  bool
 	interval time.Duration
-	api      string
+	// api is the release endpoint. It is hidden and exists so tests can point at a local server.
+	api string
 }
 
 // bind registers the auto-update flags on cmd.
@@ -214,6 +217,8 @@ func (a *app) runWithUpdate(ctx context.Context, o updateOpts, fn func(context.C
 
 	err := fn(ctx)
 
+	// fn can return on its own, for example on a listen error. Cancel so the update loop
+	// stops and wg.Wait does not block forever.
 	cancel()
 	wg.Wait()
 

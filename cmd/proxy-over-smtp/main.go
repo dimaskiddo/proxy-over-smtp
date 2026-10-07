@@ -21,6 +21,7 @@ var (
 	date    = "unknown"
 )
 
+// main runs the CLI, re-execs the binary after an auto-update and exits 1 on error.
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 

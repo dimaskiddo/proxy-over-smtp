@@ -15,11 +15,16 @@ var ErrEmptyKey = errors.New("xorstream: empty key")
 type Stream struct {
 	inner io.ReadWriter
 	key   []byte
-	rPos  int
-	wPos  int
-	wbuf  []byte
-	muR   sync.Mutex
-	muW   sync.Mutex
+
+	// Reads and writes keep separate offsets and locks, so a full-duplex stream never makes
+	// one direction wait for the other.
+	rPos int
+	wPos int
+	muR  sync.Mutex
+	muW  sync.Mutex
+
+	// wbuf is reused across writes so Write does not allocate each call.
+	wbuf []byte
 }
 
 // New wraps rw. Both ends must use the same key.
@@ -61,6 +66,9 @@ func (x *Stream) Write(p []byte) (n int, err error) {
 	xorKey(buf, p, x.key, x.wPos)
 
 	n, err = x.inner.Write(buf)
+
+	// Advance by what was actually written. After a short write the peer has decoded only n
+	// bytes, so both offsets must stay in step.
 	if n > 0 {
 		x.wPos = (x.wPos + n) % len(x.key)
 	}
@@ -77,7 +85,8 @@ func (x *Stream) Close() error {
 	return nil
 }
 
-// xorKey writes src XOR key (starting at offset pos) into dst and returns the offset after len(src) bytes.
+// xorKey writes src XOR key, starting at key offset pos, into dst and returns the offset after
+// len(src) bytes. dst may alias src.
 func xorKey(dst, src, key []byte, pos int) int {
 	for len(src) > 0 {
 		k := key[pos:]

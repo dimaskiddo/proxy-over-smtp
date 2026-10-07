@@ -26,6 +26,7 @@ func replace(exe string, bin []byte) error {
 	}
 
 	tmpName := tmp.Name()
+	// committed stops the deferred cleanup from deleting the new binary once it is installed.
 	committed := false
 	defer func() {
 		if !committed {
@@ -60,6 +61,7 @@ func replace(exe string, bin []byte) error {
 
 	if err := os.Rename(tmpName, exe); err != nil {
 		if runtime.GOOS == "windows" {
+			// Roll back, or the install would leave no executable at exe at all.
 			_ = os.Rename(exe+oldSuffix, exe)
 		}
 

@@ -14,6 +14,7 @@ func newLogger(level, format, file string, stdout io.Writer) (*slog.Logger, io.C
 		return nil, nil, fmt.Errorf("invalid log level %q: want debug, info, warn or error", level)
 	}
 
+	// The no-op closer lets PersistentPostRunE close unconditionally.
 	w, closer := stdout, io.Closer(io.NopCloser(nil))
 	if file != "" {
 		f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)

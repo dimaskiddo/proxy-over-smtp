@@ -74,6 +74,7 @@ func TestNewer(t *testing.T) {
 	}
 }
 
+// makeZip returns a zip archive that holds one file called name.
 func makeZip(t *testing.T, name string, content []byte) []byte {
 	t.Helper()
 

@@ -25,10 +25,11 @@ const defaultDrain = 30 * time.Second
 // app carries state shared by all commands: the logger, build info and the drain and restart
 // settings. The logger exists only after PersistentPreRunE has run.
 type app struct {
-	out     io.Writer
-	log     *slog.Logger
-	closer  io.Closer
-	info    BuildInfo
+	out    io.Writer
+	log    *slog.Logger
+	closer io.Closer
+	info   BuildInfo
+	// restart is atomic because the auto-update goroutine sets it while Execute reads it.
 	restart atomic.Bool
 	drain   time.Duration
 
@@ -41,6 +42,7 @@ func Execute(ctx context.Context, info BuildInfo) (restart bool, err error) {
 	root, a := newApp(info, os.Stdout)
 	err = root.ExecuteContext(ctx)
 
+	// A failed run must not re-exec, even if an update was installed earlier.
 	return err == nil && a.restart.Load(), err
 }
 
@@ -216,6 +218,7 @@ func (a *app) run(ctx context.Context, t *tunnel.Tunnel, upd updateOpts, fn func
 
 	a.log.Info("draining", "active", t.Active(), "timeout", a.drain.String())
 
+	// ctx is already cancelled here, so the drain window must start from a fresh context.
 	dctx, cancel := context.WithTimeout(context.Background(), a.drain)
 	defer cancel()
 
@@ -224,6 +227,8 @@ func (a *app) run(ctx context.Context, t *tunnel.Tunnel, upd updateOpts, fn func
 
 	if err := t.Shutdown(dctx); err != nil {
 		a.log.Warn("drain interrupted, connections closed", "active", t.Active(), "reason", err.Error())
+
+		// The stop was requested, so a forced drain is not a failed run.
 		return nil
 	}
 

@@ -8,15 +8,19 @@ import (
 
 // BuildInfo is injected by the linker from cmd/proxy-over-smtp.
 type BuildInfo struct {
+	// Version is the release tag, or "dev" for an unversioned build.
 	Version string
-	Commit  string
-	Date    string
+	// Commit is the short git revision, or "none".
+	Commit string
+	// Date is the build timestamp, or "unknown".
+	Date string
 }
 
 // resolved falls back to the module build info when the linker injected no version.
 func (b BuildInfo) resolved() (version, commit string) {
 	v, c := b.Version, b.Commit
 
+	// A plain "go install" build has no ldflags but carries its version in the module build info.
 	if v == "dev" {
 		if bi, ok := debug.ReadBuildInfo(); ok {
 			if bi.Main.Version != "" && bi.Main.Version != "(devel)" {

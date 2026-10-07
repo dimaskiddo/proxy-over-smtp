@@ -22,6 +22,7 @@ const (
 	AddrTypeNotSupported byte = 0x08
 )
 
+// Protocol bytes from RFC 1928.
 const (
 	version   = 0x05
 	noAuth    = 0x00
@@ -132,7 +133,8 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 	return net.JoinHostPort(host, fmt.Sprint(binary.BigEndian.Uint16(p))), nil
 }
 
-// WriteReply sends a reply with the bound address, or zero IPv4 when bound is not a *net.TCPAddr.
+// WriteReply sends a reply with the bound address. When bound is not a *net.TCPAddr it sends
+// a zero IPv4 address.
 func WriteReply(w io.Writer, code byte, bound net.Addr) error {
 	reply := []byte{version, code, 0x00}
 

@@ -91,7 +91,6 @@ func TestIsBlocked(t *testing.T) {
 	}
 }
 
-// startPair runs a real server accept loop and returns a client Tunnel that dials it.
 // pair is a client and a server Tunnel wired over loopback. stopServer and stopClient end
 // the accept loops without draining, like a signal does.
 type pair struct {
@@ -103,6 +102,8 @@ type pair struct {
 	cliDone    chan struct{}
 }
 
+// newPair runs a real server accept loop and a client accept loop over loopback. Cleanup stops
+// both and drains them.
 func newPair(t *testing.T, cliCfg config.Config) *pair {
 	t.Helper()
 
@@ -163,6 +164,7 @@ func newPair(t *testing.T, cliCfg config.Config) *pair {
 	return p
 }
 
+// startPair returns the client Tunnel of a default pair.
 func startPair(t *testing.T) *Tunnel {
 	t.Helper()
 	return newPair(t, config.Config{}).cli
@@ -198,6 +200,7 @@ func socksConnect(t *testing.T, cli *Tunnel, target net.Addr) io.ReadWriteCloser
 	return s
 }
 
+// echoListener returns a loopback listener that echoes every connection until the test ends.
 func echoListener(t *testing.T) net.Listener {
 	t.Helper()
 
@@ -257,7 +260,8 @@ func TestTunnelStreams(t *testing.T) {
 	wg.Wait()
 }
 
-// A stream nobody reads must not block other streams in the session.
+// TestStreamIsolation checks that a stream nobody reads does not block other streams in the
+// session.
 func TestStreamIsolation(t *testing.T) {
 	cli := startPair(t)
 	echo := echoListener(t)

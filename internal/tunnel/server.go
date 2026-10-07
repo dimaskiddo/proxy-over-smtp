@@ -72,8 +72,11 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 	}
 	defer sess.Close()
 
+	// A forced drain cuts the session, and with it every stream still open on it.
 	defer context.AfterFunc(t.hard, func() { sess.Close() })()
 
+	// open and draining decide when the session may close: only once draining has started
+	// and the last stream is gone, so in-flight transfers are never cut by a graceful drain.
 	var (
 		mu       sync.Mutex
 		open     int
@@ -108,6 +111,8 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 			return
 		}
 
+		// Keep accepting while draining so a new stream is refused at once instead of hanging
+		// until the client times out.
 		if ctx.Err() != nil {
 			vs.Close()
 			continue
@@ -158,6 +163,8 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 	switch b := first[0]; {
 	case b == 0x05:
 		proto = "socks5"
+
+		// socks5 takes a ReadWriter. Read through br so the peeked byte is not lost.
 		target, err = socks5.ReadRequest(struct {
 			io.Reader
 			io.Writer
@@ -183,6 +190,7 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 		return
 	}
 
+	// The header cap guards request parsing only. It must not truncate the relayed body.
 	lr.N = math.MaxInt64
 
 	d := net.Dialer{Timeout: defaultTimeout, Control: t.dialControl}
@@ -284,7 +292,8 @@ func (t *Tunnel) serverHandshake(conn net.Conn, r *bufio.Reader) error {
 	return nil
 }
 
-// dialControl runs after DNS resolution, so it also stops names that resolve to blocked ranges.
+// dialControl refuses blocked target addresses unless AllowPrivate is set. It runs after DNS
+// resolution, so it also stops names that resolve to blocked ranges.
 func (t *Tunnel) dialControl(_, address string, _ syscall.RawConn) error {
 	if t.cfg.AllowPrivate {
 		return nil
@@ -302,7 +311,8 @@ func (t *Tunnel) dialControl(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// isBlocked uses stdlib predicates only: ranges such as CGNAT 100.64.0.0/10 are not covered.
+// isBlocked reports whether a is loopback, private, link-local, multicast or unspecified.
+// It uses stdlib predicates only, so ranges such as CGNAT 100.64.0.0/10 are not covered.
 func isBlocked(a netip.Addr) bool {
 	a = a.Unmap()
 

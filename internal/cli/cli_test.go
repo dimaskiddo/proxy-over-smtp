@@ -6,6 +6,7 @@ import (
 	"testing"
 )
 
+// run executes the command tree with args and returns its combined stdout and stderr.
 func run(t *testing.T, args ...string) (string, error) {
 	t.Helper()
 

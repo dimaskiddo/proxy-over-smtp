@@ -67,6 +67,8 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 			return
 		}
 
+		// app is a *bufConn here, so the assertion cannot fail. The handshake runs under the
+		// deadline set above and replays the peeked ClientHello bytes.
 		tc := tls.Server(app.(net.Conn), t.tlsCfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			t.log.Debug("tls handshake failed", "peer", local.RemoteAddr().String(), "err", err)
@@ -90,8 +92,9 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 	relay.Pipe(app, remoteStream)
 }
 
-// openStream retries once on a fresh session: a peer restart leaves a dead session that
-// IsClosed reports as open until keepalive times out.
+// openStream opens a stream on the shared session, creating the session if needed. It retries
+// once on a fresh session: a peer restart leaves a dead session that IsClosed reports as open
+// until keepalive times out.
 func (t *Tunnel) openStream(ctx context.Context) (*smux.Stream, error) {
 	var err error
 	for range 2 {
@@ -111,7 +114,9 @@ func (t *Tunnel) openStream(ctx context.Context) (*smux.Stream, error) {
 	return nil, err
 }
 
-// getSession holds sessMu while dialing so concurrent local connections share one dial.
+// getSession returns the open shared session, dialing the server and running the handshake
+// when there is none. It holds sessMu while dialing so concurrent local connections share
+// one dial instead of each opening a TCP connection.
 func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 	t.sessMu.Lock()
 	defer t.sessMu.Unlock()
@@ -130,6 +135,9 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 
 	stop := context.AfterFunc(ctx, func() { remote.Close() })
 	err = t.clientHandshake(remote, reader)
+
+	// A false stop means ctx fired mid-handshake and already closed remote, so any I/O error
+	// is a side effect: report the cancellation instead.
 	if !stop() {
 		remote.Close()
 		return nil, fmt.Errorf("smtp handshake: %w", ctx.Err())

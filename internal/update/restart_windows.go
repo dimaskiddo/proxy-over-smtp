@@ -8,7 +8,8 @@ import (
 	"os/exec"
 )
 
-// Restart starts the on-disk binary as a child. Windows has no exec, so the caller exits afterwards.
+// Restart starts the on-disk binary as a child. Windows has no exec, so the caller exits
+// afterwards.
 func Restart() error {
 	exe, err := os.Executable()
 	if err != nil {

@@ -45,6 +45,7 @@ func dialClient(t *testing.T, p *pair) net.Conn {
 	return c
 }
 
+// socks4Request builds a SOCKS4 CONNECT request for addr with an empty user ID.
 func socks4Request(addr net.Addr) []byte {
 	ap := addr.(*net.TCPAddr).AddrPort()
 	req := []byte{4, 1}
@@ -54,6 +55,7 @@ func socks4Request(addr net.Addr) []byte {
 	return append(req, 0)
 }
 
+// socks4aRequest builds a SOCKS4a CONNECT request that carries host as a domain name.
 func socks4aRequest(host string, port uint16) []byte {
 	req := []byte{4, 1}
 	req = binary.BigEndian.AppendUint16(req, port)
@@ -317,6 +319,7 @@ func TestIdleSessionClosesOnDrain(t *testing.T) {
 	}
 }
 
+// roundTrip writes a message to rw and fails the test unless the same bytes come back.
 func roundTrip(t *testing.T, rw io.ReadWriter) {
 	t.Helper()
 

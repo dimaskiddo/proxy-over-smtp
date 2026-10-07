@@ -24,21 +24,29 @@ import (
 const DefaultAPI = "https://api.github.com/repos/dimaskiddo/proxy-over-smtp/releases/latest"
 
 const (
-	binaryName    = "proxy-over-smtp"
+	// binaryName is the archive prefix and the executable name inside it. It must match the
+	// GoReleaser project name.
+	binaryName = "proxy-over-smtp"
+	// checksumsName is the release asset that lists the sha256 of every archive.
 	checksumsName = "checksums.txt"
-	maxDownload   = 100 << 20
+	// maxDownload caps memory use, because the archive is held in memory while it is verified.
+	maxDownload = 100 << 20
 )
 
 // Release is a published release: its tag and asset name to download URL.
 type Release struct {
-	Tag    string
+	// Tag is the release tag, for example "v1.2.3".
+	Tag string
+	// Assets maps an asset file name to its download URL.
 	Assets map[string]string
 }
 
 // Client talks to the release API. A nil HTTP uses http.DefaultClient.
 type Client struct {
+	// HTTP is the client used for every request. Nil means http.DefaultClient.
 	HTTP *http.Client
-	API  string
+	// API is the latest-release endpoint, normally DefaultAPI.
+	API string
 }
 
 // get fetches url and returns the body. A body over limit bytes is an error rather
@@ -172,6 +180,7 @@ func verify(sums []byte, name string, data []byte) error {
 	}
 
 	got := sha256.Sum256(data)
+	// EqualFold because a checksums file may list the hex digest in upper case.
 	if !strings.EqualFold(hex.EncodeToString(got[:]), want) {
 		return fmt.Errorf("checksum mismatch for %s", name)
 	}
@@ -231,8 +240,8 @@ func assetName(version, goos, goarch string) (string, error) {
 	return fmt.Sprintf("%s_%s_%s_%s.zip", binaryName, version, o, a), nil
 }
 
-// Newer reports whether latest is a higher X.Y.Z than current. Any "-pre" or "+meta" suffix is ignored,
-// so git-describe builds compare by their base tag.
+// Newer reports whether latest is a higher X.Y.Z than current. Any "-pre" or "+meta" suffix
+// is ignored, so git-describe builds compare by their base tag.
 // ponytail: pre-release ordering is not handled; switch to x/mod/semver if it is needed.
 func Newer(latest, current string) (bool, error) {
 	l, err := parseVersion(latest)

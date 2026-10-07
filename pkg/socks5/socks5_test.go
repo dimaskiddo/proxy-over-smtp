@@ -6,11 +6,13 @@ import (
 	"testing"
 )
 
+// rw reads the request from an in-memory reader and records everything written back.
 type rw struct {
 	*bytes.Reader
 	out bytes.Buffer
 }
 
+// Write records p so tests can inspect the reply.
 func (r *rw) Write(p []byte) (int, error) { return r.out.Write(p) }
 
 func TestReadRequest(t *testing.T) {
