@@ -1,6 +1,6 @@
 # 🔒 Proxy-Over-SMTP
 
-**Proxy-Over-SMTP** is a SOCKS4/5, HTTP and HTTPS proxy tunnel that disguises its traffic as an SMTP session and XOR-obfuscates the payload to confuse Deep Packet Inspection (DPI). This project is inspired by [smtp-tunnel-proxy](https://github.com/x011/smtp-tunnel-proxy).
+**Proxy-Over-SMTP** is a SOCKS4/5, HTTP and HTTPS proxy tunnel that opens with a fake SMTP session and carries the payload through a selectable XOR or AES-256-GCM stream. This project is inspired by [smtp-tunnel-proxy](https://github.com/x011/smtp-tunnel-proxy).
 
 A **client** exposes one local proxy port that speaks SOCKS4/4a, SOCKS5, HTTP and HTTPS. A **server** answers a fake SMTP handshake, then carries every proxied connection as a multiplexed stream inside a single TCP connection.
 
@@ -22,14 +22,15 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 | `AUDIT: ...` plain text lines | `slog` structured lines (`--log-format text` or `json`) |
 | `-allow-private` | `server --allow-private` |
 
-**Client and server must be upgraded together.** The tunnel now uses smux protocol v2 (per-stream flow control), so old and new binaries do not interoperate.
+**Client and server must be upgraded together.** The tunnel now uses smux protocol v2 (per-stream flow control) and a challenge-response handshake, so old and new binaries do not interoperate.
 
 ---
 
 ## ✨ Why Proxy-Over-SMTP?
 
 *   **🎭 SMTP Disguise:** Every connection opens with a plausible `220` / `EHLO` / `DATA` exchange before tunneling starts.
-*   **🧩 XOR Obfuscation:** Payload is XORed with a rolling key derived from your shared secret.
+*   **🔐 Selectable Cipher:** `--cipher aes` (default) wraps the tunnel in AES-256-GCM records for confidentiality and integrity; `--cipher xor` keeps a fast rolling-key XOR for obfuscation only.
+*   **🤝 Challenge-Response Handshake:** The server sends a fresh nonce and the client answers with an HMAC of the secret. The secret is never sent on the wire, and both stream keys are derived from it per connection.
 *   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
 *   **🔧 Tuned Sockets:** Every socket gets fixed kernel options in code: 4096-byte send and receive buffers, `TCP_NODELAY`, TCP keepalive, and `SO_REUSEADDR` / `SO_REUSEPORT` on Unix listeners. Nothing to configure. The small buffers suit many small flows, not bulk transfer: see [Socket options](docs/ARCHITECTURE.md#5-socket-options).
 *   **🧦 Many Proxy Protocols, One Port:** SOCKS4/4a, SOCKS5, HTTP (plain and `CONNECT`) and HTTPS (TLS proxy listener) are auto-detected from the first byte. Works with browsers, `curl`, `git`, `apt` and anything that honors `http_proxy` / `https_proxy` or SOCKS.
@@ -45,7 +46,7 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 ```mermaid
 graph LR
     App["Browser / curl<br/>(SOCKS4/5, HTTP, HTTPS)"] --> Client["Client<br/>:1080"]
-    Client -- "fake SMTP handshake<br/>+ XOR + smux" --> Server["Server<br/>:465"]
+    Client -- "fake SMTP handshake<br/>+ XOR / AES-256-GCM<br/>+ smux" --> Server["Server<br/>:465"]
     Server -- "protocol detect + negotiate<br/>per stream" --> Target["Target host"]
 ```
 
@@ -152,7 +153,9 @@ Server and client use the same binary and the same secret. Every flag can also b
 |---|---|---|---|---|
 | `--listen` | `PROXY_OVER_SMTP_LISTEN` | server `0.0.0.0:465`, client `0.0.0.0:1080` | server, client | Listen address |
 | `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address the client dials |
-| `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Shared secret (EHLO token and XOR key). Prefer the env var |
+| `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Shared secret: handshake authentication and stream key master. Prefer the env var |
+| `--cipher` | `PROXY_OVER_SMTP_CIPHER` | `aes` | server, client | Stream cipher: `xor` or `aes`. Both ends must match |
+| `--max-streams` | `PROXY_OVER_SMTP_MAX_STREAMS` | `128` | server, client | Max concurrent streams per session. Enforced by the server; a client value is accepted but ignored |
 | `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback, private and link-local targets (blocked by default) |
 | `--tls-cert` | `PROXY_OVER_SMTP_TLS_CERT` | empty | client | PEM certificate. With `--tls-key`, enables the HTTPS (TLS) proxy listener |
 | `--tls-key` | `PROXY_OVER_SMTP_TLS_KEY` | empty | client | PEM private key for `--tls-cert`. Both or neither |
@@ -162,6 +165,10 @@ Server and client use the same binary and the same secret. Every flag can also b
 | `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file |
 | `--auto-update` | `PROXY_OVER_SMTP_AUTO_UPDATE` | `false` | server, client | Check for new releases, install and restart in place |
 | `--update-interval` | `PROXY_OVER_SMTP_UPDATE_INTERVAL` | `24h` | server, client | Auto-update check interval, minimum `1h` |
+
+`--update-api` (`PROXY_OVER_SMTP_UPDATE_API`) is hidden: it overrides the release endpoint for tests and mirrors. It is trusted for both the archive and its checksum, so point it only at a source you control.
+
+`--listen` and `--remote` must be `host:port`; a malformed value is rejected at startup instead of at bind time.
 
 ### 🧭 Using the proxy
 
@@ -189,7 +196,7 @@ Notes:
 - No proxy authentication. SOCKS4 `USERID` and `Proxy-Authorization` are ignored, so bind the client to a trusted interface.
 - Plain HTTP requests use one request per connection (`Connection: close`), and only `http://` absolute-form requests are proxied.
 - HTTP and SOCKS refusals map as: blocked target is `403` / SOCKS5 `0x02`, timeout is `504`, other failures `502`. SOCKS4 always replies `0x5B`.
-- The certificate loads once at start. Restart to rotate it. TLS covers only the hop from your application to the client. The client-to-server tunnel is unchanged.
+- The certificate loads once at start. Restart to rotate it. TLS covers only the hop from your application to the client. The client-to-server hop is protected by `--cipher`.
 
 ### 🛑 Graceful shutdown
 
@@ -224,7 +231,7 @@ time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113
 time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" target=10.0.0.1:80 err="dial tcp 10.0.0.1:80: target address not allowed"
 ```
 
-`--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged.
+`--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged; the target host and port are, as the audit trail, so treat the log stream as sensitive when it leaves the host.
 
 ---
 
@@ -266,8 +273,6 @@ See also the list of [contributors](https://github.com/dimaskiddo/proxy-over-smt
 ## ⚠️ Disclaimer
 
 **DO WITH YOUR OWN RISK (DWYR)**. This software is provided "as is", without warranty of any kind, express or implied. The authors are not responsible for any damage caused by the use of this application.
-
-**This is obfuscation, not encryption.** XOR hides patterns from naive DPI only. The secret is sent in plaintext in the `EHLO` line and there is no TLS. Do not rely on it for confidentiality.
 
 ---
 

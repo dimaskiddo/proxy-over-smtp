@@ -41,22 +41,40 @@ type Tunnel struct {
 	tlsCfg *tls.Config
 
 	// conns tracks every handler so Shutdown can wait for them. active mirrors it because a
-	// WaitGroup cannot report its count.
-	conns  sync.WaitGroup
-	active atomic.Int64
+	// WaitGroup cannot report its count. shutMu guards shutting against spawn, so an Add never
+	// races the Wait that Shutdown starts.
+	conns    sync.WaitGroup
+	active   atomic.Int64
+	shutMu   sync.Mutex
+	shutting bool
 
 	// hard is cancelled by Shutdown to close every connection that outlived the drain.
 	hard       context.Context
 	hardCancel context.CancelFunc
 
-	// sess is the client's shared session, guarded by sessMu. A server never sets it.
-	sessMu sync.Mutex
-	sess   *smux.Session
+	// sess is the client's shared session, guarded by sessMu. A server never sets it. dialing is
+	// non-nil while one dial runs, so concurrent local connections wait for it instead of each
+	// opening their own TCP connection.
+	sessMu  sync.Mutex
+	sess    *smux.Session
+	dialing chan struct{}
 }
 
 // New returns a Tunnel for cfg. When cfg sets TLSCert and TLSKey the key pair is loaded now
 // so a bad file fails at startup.
 func New(cfg config.Config, logger *slog.Logger) (*Tunnel, error) {
+	// Rejected here too, not only in Config.Validate, because an empty secret would otherwise
+	// derive session keys from an empty HMAC key for any caller that skips validation.
+	if cfg.Secret == "" {
+		return nil, errors.New("secret is required")
+	}
+
+	// A caller that skips Validate gets the cap anyway, so an unset value can never mean
+	// unlimited streams.
+	if cfg.MaxStreams <= 0 {
+		cfg.MaxStreams = config.DefaultMaxStreams
+	}
+
 	t := &Tunnel{cfg: cfg, log: logger}
 	t.hard, t.hardCancel = context.WithCancel(context.Background())
 
@@ -78,10 +96,15 @@ func (t *Tunnel) Active() int64 {
 	return t.active.Load()
 }
 
-// Shutdown waits for active handlers to finish. RunServer and RunClient must already have
-// returned, which stops new connections. When ctx ends first, every remaining connection is
-// closed and Shutdown returns ctx.Err(). It returns nil after a clean drain.
+// Shutdown waits for active handlers to finish and marks the Tunnel closed. RunServer and
+// RunClient must already have returned, which stops new connections. When ctx ends first, every
+// remaining connection is closed and Shutdown returns ctx.Err(). It returns nil after a clean
+// drain, and is safe to call more than once or before any Run.
 func (t *Tunnel) Shutdown(ctx context.Context) error {
+	t.shutMu.Lock()
+	t.shutting = true
+	t.shutMu.Unlock()
+
 	done := make(chan struct{})
 	go func() {
 		t.conns.Wait()
@@ -113,14 +136,29 @@ func (t *Tunnel) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// spawn runs fn as a tracked handler so Shutdown waits for it and Active counts it.
-func (t *Tunnel) spawn(fn func()) {
+// spawn runs fn as a tracked handler so Shutdown waits for it and Active counts it. Once
+// Shutdown has started, fn is dropped instead: adding to a WaitGroup after Wait began is a
+// misuse panic, and a dropped handler never leaks because it owns the connection it closes.
+func (t *Tunnel) spawn(fn func()) bool {
+	t.shutMu.Lock()
+	if t.shutting {
+		t.shutMu.Unlock()
+		return false
+	}
+
+	t.conns.Add(1)
+	t.shutMu.Unlock()
+
 	t.active.Add(1)
 
-	t.conns.Go(func() {
+	go func() {
 		defer t.active.Add(-1)
+		defer t.conns.Done()
+
 		fn()
-	})
+	}()
+
+	return true
 }
 
 // bufConn keeps bytes already buffered by a peeking reader and still closes the socket.
@@ -134,10 +172,19 @@ func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
 // acceptLoop accepts connections and runs handle for each until ctx is done, then returns nil.
 // It only stops accepting: open connections keep running until they finish or Shutdown closes
-// them. Accept errors are retried with capped backoff.
+// them. Accept errors are retried with capped backoff. It refuses to start, or stops, once
+// Shutdown has run, so a late connection is closed instead of handled.
 func (t *Tunnel) acceptLoop(ctx context.Context, ln net.Listener, handle func(net.Conn)) error {
 	stop := context.AfterFunc(ctx, func() { ln.Close() })
 	defer stop()
+
+	t.shutMu.Lock()
+	shut := t.shutting
+	t.shutMu.Unlock()
+
+	if shut {
+		return errors.New("tunnel is shut down")
+	}
 
 	backoff := minBackoff
 	for {
@@ -161,12 +208,16 @@ func (t *Tunnel) acceptLoop(ctx context.Context, ln net.Listener, handle func(ne
 
 		backoff = minBackoff
 
-		t.spawn(func() {
-			// A forced drain closes the connection to unblock the handler. The returned stop
-			// func, called on return, unregisters it so finished handlers do not leak callbacks.
+		// A forced drain closes the connection to unblock the handler. The returned stop
+		// func, called on return, unregisters it so finished handlers do not leak callbacks.
+		// spawn reports false when Shutdown already ran, and the connection must not leak.
+		if !t.spawn(func() {
 			defer context.AfterFunc(t.hard, func() { conn.Close() })()
 			defer conn.Close()
 			handle(conn)
-		})
+		}) {
+			conn.Close()
+			return errors.New("tunnel is shut down")
+		}
 	}
 }

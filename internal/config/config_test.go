@@ -8,12 +8,21 @@ func TestValidate(t *testing.T) {
 		cfg     Config
 		wantErr bool
 	}{
-		{"ok", Config{Listen: ":1", Secret: "s"}, false},
-		{"empty secret", Config{Listen: ":1"}, true},
-		{"empty listen", Config{Secret: "s"}, true},
-		{"tls pair", Config{Listen: ":1", Secret: "s", TLSCert: "c", TLSKey: "k"}, false},
-		{"tls cert only", Config{Listen: ":1", Secret: "s", TLSCert: "c"}, true},
-		{"tls key only", Config{Listen: ":1", Secret: "s", TLSKey: "k"}, true},
+		{"ok aes", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, false},
+		{"ok xor", Config{Listen: ":1", Secret: "s", Cipher: CipherXOR, MaxStreams: DefaultMaxStreams}, false},
+		{"empty secret", Config{Listen: ":1", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, true},
+		{"empty cipher", Config{Listen: ":1", Secret: "s", MaxStreams: DefaultMaxStreams}, true},
+		{"bad cipher", Config{Listen: ":1", Secret: "s", Cipher: "aes-256-gcm", MaxStreams: DefaultMaxStreams}, true},
+		{"empty listen", Config{Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, true},
+		{"bad listen no port", Config{Listen: "0.0.0.0", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, true},
+		{"bad listen too many colons", Config{Listen: "0.0.0.0:80:90", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, true},
+		{"ok remote", Config{Listen: ":1", Remote: "127.0.0.1:465", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, false},
+		{"bad remote", Config{Listen: ":1", Remote: "127.0.0.1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams}, true},
+		{"tls pair", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, TLSCert: "c", TLSKey: "k"}, false},
+		{"tls cert only", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, TLSCert: "c"}, true},
+		{"tls key only", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: DefaultMaxStreams, TLSKey: "k"}, true},
+		{"max streams zero", Config{Listen: ":1", Secret: "s", Cipher: CipherAES}, true},
+		{"max streams negative", Config{Listen: ":1", Secret: "s", Cipher: CipherAES, MaxStreams: -1}, true},
 	}
 
 	for _, tt := range tests {

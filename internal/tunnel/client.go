@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -13,7 +14,6 @@ import (
 	"github.com/xtaci/smux"
 
 	"github.com/dimaskiddo/proxy-over-smtp/pkg/relay"
-	"github.com/dimaskiddo/proxy-over-smtp/pkg/xorstream"
 )
 
 // RunClient listens for local proxy connections and pipes each one into a stream on the
@@ -109,6 +109,14 @@ func (t *Tunnel) openStream(ctx context.Context) (*smux.Stream, error) {
 			return s, nil
 		}
 
+		// Drop the failed session under the lock, and only while it is still the shared one, so a
+		// session another goroutine just installed is not closed underneath it.
+		t.sessMu.Lock()
+		if t.sess == sess {
+			t.sess = nil
+		}
+		t.sessMu.Unlock()
+
 		sess.Close()
 	}
 
@@ -116,17 +124,58 @@ func (t *Tunnel) openStream(ctx context.Context) (*smux.Stream, error) {
 }
 
 // getSession returns the open shared session, dialing the server and running the handshake
-// when there is none. It holds sessMu while dialing so concurrent local connections share
-// one dial instead of each opening a TCP connection.
+// when there is none. Only one dial runs at a time: a second caller waits for it and then reuses
+// its result, so a burst of local connections opens one TCP connection instead of one each. The
+// lock is never held across the dial, so an established session never waits behind a slow one.
 func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
-	t.sessMu.Lock()
-	defer t.sessMu.Unlock()
+	for {
+		t.sessMu.Lock()
 
-	if t.sess != nil && !t.sess.IsClosed() {
-		return t.sess, nil
+		if t.sess != nil && !t.sess.IsClosed() {
+			sess := t.sess
+			t.sessMu.Unlock()
+
+			return sess, nil
+		}
+
+		if wait := t.dialing; wait != nil {
+			t.sessMu.Unlock()
+
+			select {
+			case <-wait:
+				continue
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+
+		done := make(chan struct{})
+		t.dialing = done
+		t.sessMu.Unlock()
+
+		sess, err := t.dialSession(ctx)
+
+		t.sessMu.Lock()
+		t.dialing = nil
+		if err == nil {
+			t.sess = sess
+		}
+		t.sessMu.Unlock()
+
+		close(done)
+
+		if err != nil {
+			return nil, err
+		}
+
+		return sess, nil
 	}
+}
 
+// dialSession dials the server, runs the handshake and wraps the connection in a new session.
+func (t *Tunnel) dialSession(ctx context.Context) (*smux.Session, error) {
 	d := dialer(nil)
+
 	remote, err := d.DialContext(ctx, "tcp", t.cfg.Remote)
 	if err != nil {
 		return nil, fmt.Errorf("dial server: %w", err)
@@ -135,7 +184,7 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 	reader := bufio.NewReader(remote)
 
 	stop := context.AfterFunc(ctx, func() { remote.Close() })
-	err = t.clientHandshake(remote, reader)
+	nonce, err := t.clientHandshake(remote, reader)
 
 	// A false stop means ctx fired mid-handshake and already closed remote, so any I/O error
 	// is a side effect: report the cancellation instead.
@@ -149,10 +198,10 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 		return nil, fmt.Errorf("smtp handshake: %w", err)
 	}
 
-	stream, err := xorstream.New(&bufConn{r: reader, Conn: remote}, t.cfg.Secret)
+	stream, err := t.wrapStream(&bufConn{r: reader, Conn: remote}, nonce, false)
 	if err != nil {
 		remote.Close()
-		return nil, fmt.Errorf("xor stream: %w", err)
+		return nil, err
 	}
 
 	sess, err := smux.Client(stream, muxConfig())
@@ -161,34 +210,46 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 		return nil, fmt.Errorf("smux client: %w", err)
 	}
 
-	t.sess = sess
-	return t.sess, nil
+	return sess, nil
 }
 
-// clientHandshake plays the client side of the fake SMTP session. The greeting and replies
-// are checked by prefix only; the server is the side that authenticates.
-func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) error {
+// clientHandshake plays the client side of the fake SMTP session. It parses the server nonce,
+// answers with the HMAC proof and returns the nonce for key derivation. The greeting and the
+// final replies are checked by prefix only; the server is the side that authenticates.
+func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error) {
 	if err := conn.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
-	line, err := r.ReadString('\n')
+	line, err := readLine(r, maxLine)
 	if err != nil {
-		return fmt.Errorf("read 220: %w", err)
+		return nil, fmt.Errorf("read 220: %w", err)
 	}
 
-	if !strings.HasPrefix(line, "220") {
-		return fmt.Errorf("unexpected greeting")
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != "220" {
+		return nil, fmt.Errorf("unexpected greeting")
 	}
 
-	if _, err := fmt.Fprintf(conn, "EHLO %s\r\n", t.cfg.Secret); err != nil {
-		return fmt.Errorf("write ehlo: %w", err)
+	nonce, err := base64.StdEncoding.DecodeString(fields[len(fields)-1])
+	if err != nil || len(nonce) != nonceLen {
+		return nil, fmt.Errorf("bad server nonce")
 	}
 
-	for {
-		line, err = r.ReadString('\n')
+	if _, err := fmt.Fprintf(conn, "EHLO %s\r\n", proofValue(t.cfg.Secret, nonce)); err != nil {
+		return nil, fmt.Errorf("write ehlo: %w", err)
+	}
+
+	// The reply is one or more 250- continuation lines followed by a final 250. The cap keeps a
+	// peer from holding the handshake open with continuations forever.
+	for i := 0; ; i++ {
+		if i >= maxReplyLines {
+			return nil, fmt.Errorf("too many 250 replies")
+		}
+
+		line, err = readLine(r, maxLine)
 		if err != nil {
-			return fmt.Errorf("read 250: %w", err)
+			return nil, fmt.Errorf("read 250: %w", err)
 		}
 
 		if strings.HasPrefix(line, "250 ") {
@@ -197,21 +258,21 @@ func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) error {
 	}
 
 	if _, err := fmt.Fprintf(conn, "DATA\r\n"); err != nil {
-		return fmt.Errorf("write data: %w", err)
+		return nil, fmt.Errorf("write data: %w", err)
 	}
 
-	line, err = r.ReadString('\n')
+	line, err = readLine(r, maxLine)
 	if err != nil {
-		return fmt.Errorf("read 354: %w", err)
+		return nil, fmt.Errorf("read 354: %w", err)
 	}
 
 	if !strings.HasPrefix(line, "354") {
-		return fmt.Errorf("unexpected data reply")
+		return nil, fmt.Errorf("unexpected data reply")
 	}
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("clear deadline: %w", err)
+		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
-	return nil
+	return nonce, nil
 }

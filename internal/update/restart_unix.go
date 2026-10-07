@@ -5,6 +5,7 @@ package update
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -13,6 +14,11 @@ func Restart() error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("resolve executable: %w", err)
+	}
+
+	// Run the same path update replaced: a symlinked install must exec the target, not the link.
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
 	}
 
 	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {

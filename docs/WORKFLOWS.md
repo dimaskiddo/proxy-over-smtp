@@ -17,6 +17,7 @@ flowchart TD
 
     Route -- server --> SAccept[server: accept]
     Route -- client --> CAccept[client: accept]
+    Route -- update --> UCheck[release check, verify, swap]
     Route -- version --> Done
 
     subgraph Server
@@ -55,16 +56,16 @@ flowchart TD
 1. `signal.NotifyContext` for `SIGINT` / `SIGTERM`, then `cli.Execute(ctx, BuildInfo)`.
 2. Cobra parses the subcommand (`server`, `client`, `version`, `update`) and flags.
 3. `PersistentPreRunE`: flags not set on the command line are filled from `PROXY_OVER_SMTP_*` env (flag > env > default). Then build the `slog` logger (`--log-level`, `--log-format`, optional `--log-file` tee).
-4. `RunE`: `Config.Validate()` (secret required, TLS cert and key together, non-negative `--drain-timeout`), `tunnel.New(cfg, logger)` (loads the TLS key pair, can fail), then `RunServer(ctx)` or `RunClient(ctx)`.
+4. `RunE`: `Config.Validate()` (secret required, one of the two ciphers, `--max-streams` above zero, `--listen` and `--remote` in `host:port` shape, TLS cert and key together, non-negative `--drain-timeout`), `tunnel.New(cfg, logger)` (loads the TLS key pair, can fail), then `RunServer(ctx)` or `RunClient(ctx)`.
 5. After the accept loop returns: drain (stage 5), then `PersistentPostRunE` closes the log file. Any error exits with code 1.
 6. If auto-update installed a release, `Execute` returns `restart=true`. `main` then calls `update.Restart()`.
 
 ### 2. Server (`internal/tunnel/server.go`)
 
 1. Listen on `--listen` through the tuned listener (`t.listen`: buffers, reuse, keepalive, see [ARCHITECTURE.md](ARCHITECTURE.md#5-socket-options)). `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
-2. Per accepted connection (tracked in `conns`): 30s deadline, SMTP handshake with exact secret match (see [ARCHITECTURE.md](ARCHITECTURE.md#2-handshake-fake-smtp)).
-3. Clear the deadline, wrap in `xorstream.New(rw, secret)`, start `smux.Server`.
-4. Loop on `sess.AcceptStream()`. Once draining starts, new streams are closed at once and the session closes when its last stream ends. Per stream, in its own tracked goroutine with a 30s deadline until the reply is sent:
+2. Per accepted connection (tracked in `conns`): 30s deadline, challenge-response SMTP handshake that proves the secret with an HMAC (see [ARCHITECTURE.md](ARCHITECTURE.md#2-handshake-fake-smtp-challenge-response)). Every handshake line is capped at 4KB, so an oversized `EHLO` is rejected instead of buffered.
+3. Clear the deadline, wrap in the `--cipher` stream (`xorstream.New(rw, secret)` or `aesstream.New(rw, s2c, c2s)`), start `smux.Server`.
+4. Loop on `sess.AcceptStream()`. Once draining starts, new streams are closed at once and the session closes when its last stream ends. Streams beyond `--max-streams` are also closed at once, so a peer cannot hold unbounded handlers. Per stream, in its own tracked goroutine with a 30s deadline until the reply is sent:
 
 ```mermaid
 sequenceDiagram
@@ -87,7 +88,7 @@ For plain HTTP (absolute-form) there is no `200`: the server rewrites the reques
 
 1. Listen on `--listen` through the same tuned listener. `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
 2. Per accepted local connection (tracked in `conns`): 30s deadline, peek the first byte. If it is `0x16` and `--tls-cert`/`--tls-key` are set, terminate TLS (handshake bound by the same deadline). If it is `0x16` without a certificate, close with debug log `tls not enabled`. Then `getSession`.
-3. `getSession` under `sessMu`: reuse `Tunnel.sess` if open. Otherwise dial `--remote` (30s, tuned dialer, cancelled by shutdown), run the client handshake, wrap in XOR, `smux.Client`.
+3. `getSession` under `sessMu`: reuse `Tunnel.sess` if open. Otherwise dial `--remote` (30s, tuned dialer, cancelled by shutdown), run the client handshake, wrap in the `--cipher` stream, `smux.Client`. One dial runs at a time; concurrent local connections wait for it and share the result. A dial that fails drops the session under the lock and retries once on a fresh one.
 4. Open a stream (on failure drop the session and retry once on a fresh one) and `relay.Pipe(local, stream)`. The application's proxy bytes (decrypted when TLS was terminated) travel unchanged to the server.
 
 ### 4. Update (`internal/update/`, `internal/cli/update.go`)
@@ -147,12 +148,18 @@ Auto-update runs the same drain before it re-executes.
 | Scenario | Recovery |
 |---|---|
 | Handshake fails or times out (30s) | Connection closed, no reply. Logged at debug (`handshake rejected`) |
-| Wrong secret in `EHLO` | Connection closed, no reply. Debug log `handshake rejected` |
+| Wrong proof or malformed nonce | Connection closed, no reply. Debug log `handshake rejected` |
+| Handshake line over 4KB, or over 16 `250-` replies | Connection closed, no reply. Debug log `handshake rejected` |
+| Cipher differs between ends | Handshake succeeds, then the first AES record fails to open: session dropped, next local connection re-dials |
+| AES record fails authentication (wrong key, tampered data, lost position) | Stream error, session dropped. Warn `open stream failed` on the client |
 | Client cannot dial server or handshake fails | Log `open stream failed` (warn) with `err`, local connection closed. Next local connection retries |
 | smux session closed or keepalive times out (60s) | Next local connection creates a new session |
 | Stream open fails on a stale session | Session dropped, one retry on a fresh session |
 | First byte is not `0x05`, `0x04` or `A`-`Z` | Stream closed. Debug log `proxy request rejected` |
+| Stream beyond `--max-streams` (default 128) on a session | Stream closed at once. Debug log `stream refused` |
+| `RunServer`/`RunClient` after `Shutdown` | Returns `tunnel is shut down`, no listener started. `Shutdown` before any Run returns nil |
 | SOCKS5 version is not 5, no no-auth method, empty domain | Stream closed (`0xFF` reply for no method). Debug log `proxy request rejected` |
+| SOCKS5 request truncated mid-field | `0x01` general failure reply, stream closed. Debug log `proxy request rejected` |
 | SOCKS4 command is not CONNECT, or user ID / domain over 255 bytes | Reply `0x5B`, stream closed |
 | HTTP request is origin-form, non-http scheme, or malformed | Reply `400`, stream closed |
 | TLS hello at the client without `--tls-cert` | Local connection closed. Debug log `tls not enabled` |
@@ -167,11 +174,13 @@ Auto-update runs the same drain before it re-executes.
 | `setsockopt` fails on a dial | Dial fails like any dial error: client `open stream failed`, server `target unreachable` |
 | `--log-file` cannot be opened | Exit 1 |
 | Secret missing, bad env value (e.g. `PROXY_OVER_SMTP_ALLOW_PRIVATE=x`), bad `--log-level` / `--log-format` | Exit 1 at startup |
+| Malformed `--listen` / `--remote` (no port, too many colons) | Exit 1 at startup, before any bind |
 | Old-style flag (`-secret`, `-mode`) | Exit 1, unknown shorthand flag |
 | Drain exceeds `--drain-timeout`, or a second signal arrives | Warn `drain interrupted, connections closed`, remaining connections cut, process exits |
 | Negative `--drain-timeout`, `--tls-cert` without `--tls-key`, unreadable key pair | Exit 1 at startup |
 | Update check fails (network, GitHub rate limit 403/429) | `update` exits 1. Auto-update warns `update check failed` and retries next interval |
 | Checksum mismatch or missing asset for this platform | Error, binary untouched. Auto-update warns `update failed` |
+| Stale `<exe>.old` from a previous Windows update | Removed and the rename retried once, so the update still succeeds |
 | Binary location not writable | Error with permission hint, binary untouched |
 | Re-exec fails after a successful swap | `restart:` on stderr, exit 1. New binary is on disk: start it manually |
 | `--update-interval` below 1h | Exit 1 at startup |

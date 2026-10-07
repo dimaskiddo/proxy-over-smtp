@@ -40,7 +40,8 @@ func applyEnv(fs *pflag.FlagSet) error {
 	return err
 }
 
-// annotateEnv appends the env var name to every flag's help text.
+// annotateEnv appends the env var name to every flag's help text, including the root persistent
+// flags, so --help never hides a flag's env var.
 func annotateEnv(cmd *cobra.Command) {
 	add := func(f *pflag.Flag) {
 		if f.Name != "help" && f.Name != "version" {
@@ -49,6 +50,7 @@ func annotateEnv(cmd *cobra.Command) {
 	}
 
 	cmd.LocalFlags().VisitAll(add)
+	cmd.PersistentFlags().VisitAll(add)
 
 	for _, c := range cmd.Commands() {
 		annotateEnv(c)

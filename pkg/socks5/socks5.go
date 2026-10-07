@@ -47,7 +47,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 
 	methods := make([]byte, head[1])
 	if _, err := io.ReadFull(rw, methods); err != nil {
-		return "", fmt.Errorf("read methods: %w", err)
+		return fail(rw, GeneralFailure, fmt.Errorf("read methods: %w", err))
 	}
 
 	offered := false
@@ -72,11 +72,11 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 
 	req := make([]byte, 4)
 	if _, err := io.ReadFull(rw, req); err != nil {
-		return "", fmt.Errorf("read request: %w", err)
+		return fail(rw, GeneralFailure, fmt.Errorf("read request: %w", err))
 	}
 
 	if req[0] != version {
-		return "", fmt.Errorf("unsupported socks version %d", req[0])
+		return fail(rw, GeneralFailure, fmt.Errorf("unsupported socks version %d", req[0]))
 	}
 
 	if req[1] != cmdCon {
@@ -89,7 +89,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 	case atypIPv4:
 		ip := make([]byte, 4)
 		if _, err := io.ReadFull(rw, ip); err != nil {
-			return "", fmt.Errorf("read ipv4: %w", err)
+			return fail(rw, GeneralFailure, fmt.Errorf("read ipv4: %w", err))
 		}
 
 		host = net.IP(ip).String()
@@ -97,7 +97,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 	case atypIPv6:
 		ip := make([]byte, 16)
 		if _, err := io.ReadFull(rw, ip); err != nil {
-			return "", fmt.Errorf("read ipv6: %w", err)
+			return fail(rw, GeneralFailure, fmt.Errorf("read ipv6: %w", err))
 		}
 
 		host = net.IP(ip).String()
@@ -105,7 +105,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 	case atypName:
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(rw, l); err != nil {
-			return "", fmt.Errorf("read domain length: %w", err)
+			return fail(rw, GeneralFailure, fmt.Errorf("read domain length: %w", err))
 		}
 
 		if l[0] == 0 {
@@ -115,7 +115,7 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 
 		name := make([]byte, l[0])
 		if _, err := io.ReadFull(rw, name); err != nil {
-			return "", fmt.Errorf("read domain: %w", err)
+			return fail(rw, GeneralFailure, fmt.Errorf("read domain: %w", err))
 		}
 
 		host = string(name)
@@ -127,10 +127,18 @@ func ReadRequest(rw io.ReadWriter) (string, error) {
 
 	p := make([]byte, 2)
 	if _, err := io.ReadFull(rw, p); err != nil {
-		return "", fmt.Errorf("read port: %w", err)
+		return fail(rw, GeneralFailure, fmt.Errorf("read port: %w", err))
 	}
 
 	return net.JoinHostPort(host, fmt.Sprint(binary.BigEndian.Uint16(p))), nil
+}
+
+// fail answers with code and returns err, so a peer that stops mid-request gets a reply instead
+// of hanging until its deadline.
+func fail(rw io.ReadWriter, code byte, err error) (string, error) {
+	_ = WriteReply(rw, code, nil)
+
+	return "", err
 }
 
 // WriteReply sends a reply with the bound address. When bound is not a *net.TCPAddr it sends

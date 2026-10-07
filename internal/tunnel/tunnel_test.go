@@ -30,12 +30,12 @@ func TestHandshake(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv, err := New(config.Config{Secret: "s3cret"}, slog.New(slog.DiscardHandler))
+			srv, err := New(config.Config{Secret: "s3cret", Cipher: config.CipherAES}, slog.New(slog.DiscardHandler))
 			if err != nil {
 				t.Fatal(err)
 			}
 
-			cli, err := New(config.Config{Secret: tt.clientSecret}, slog.New(slog.DiscardHandler))
+			cli, err := New(config.Config{Secret: tt.clientSecret, Cipher: config.CipherAES}, slog.New(slog.DiscardHandler))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -46,14 +46,14 @@ func TestHandshake(t *testing.T) {
 
 			srvErr := make(chan error, 1)
 			go func() {
-				err := srv.serverHandshake(s, bufio.NewReader(s))
+				_, err := srv.serverHandshake(s, bufio.NewReader(s))
 				if err != nil {
 					s.Close()
 				}
 				srvErr <- err
 			}()
 
-			cliErr := cli.clientHandshake(c, bufio.NewReader(c))
+			_, cliErr := cli.clientHandshake(c, bufio.NewReader(c))
 			if (cliErr != nil) != tt.wantErr {
 				t.Fatalf("client err = %v, wantErr %v", cliErr, tt.wantErr)
 			}
@@ -77,8 +77,19 @@ func TestIsBlocked(t *testing.T) {
 		{"172.16.0.1", true},
 		{"169.254.169.254", true},
 		{"0.0.0.0", true},
+		{"0.1.2.3", true},
+		{"100.64.0.1", true},
+		{"100.127.255.254", true},
+		{"192.0.0.1", true},
+		{"240.0.0.1", true},
+		{"255.255.255.255", true},
 		{"::ffff:127.0.0.1", true},
 		{"8.8.8.8", false},
+		{"1.1.1.1", false},
+		{"100.63.255.255", false},
+		{"100.128.0.1", false},
+		{"192.0.1.1", false},
+		{"239.255.255.255", true},
 		{"2606:4700::1111", false},
 	}
 
@@ -109,7 +120,12 @@ func newPair(t *testing.T, cliCfg config.Config) *pair {
 
 	log := slog.New(slog.DiscardHandler)
 
-	srv, err := New(config.Config{Secret: "s3cret", AllowPrivate: true}, log)
+	// The two ends must agree on the cipher, so the client's choice drives the server's.
+	if cliCfg.Cipher == "" {
+		cliCfg.Cipher = config.CipherAES
+	}
+
+	srv, err := New(config.Config{Secret: "s3cret", Cipher: cliCfg.Cipher, AllowPrivate: true}, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,35 +245,151 @@ func echoListener(t *testing.T) net.Listener {
 }
 
 func TestTunnelStreams(t *testing.T) {
-	cli := startPair(t)
-	echo := echoListener(t)
+	for _, cipher := range []string{config.CipherAES, config.CipherXOR} {
+		t.Run(cipher, func(t *testing.T) {
+			cli := newPair(t, config.Config{Cipher: cipher}).cli
+			echo := echoListener(t)
 
-	payload := bytes.Repeat([]byte("0123456789abcdef"), 4096)
+			payload := bytes.Repeat([]byte("0123456789abcdef"), 4096)
 
-	var wg sync.WaitGroup
-	for i := 0; i < 20; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+			var wg sync.WaitGroup
+			for i := 0; i < 20; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
 
-			s := socksConnect(t, cli, echo.Addr())
-			defer s.Close()
+					s := socksConnect(t, cli, echo.Addr())
+					defer s.Close()
 
-			go s.Write(payload)
+					go s.Write(payload)
 
-			got := make([]byte, len(payload))
-			if _, err := io.ReadFull(s, got); err != nil {
-				t.Error(err)
-				return
+					got := make([]byte, len(payload))
+					if _, err := io.ReadFull(s, got); err != nil {
+						t.Error(err)
+						return
+					}
+
+					if !bytes.Equal(got, payload) {
+						t.Error("payload mismatch")
+					}
+				}()
 			}
 
-			if !bytes.Equal(got, payload) {
-				t.Error("payload mismatch")
-			}
-		}()
+			wg.Wait()
+		})
+	}
+}
+
+// TestShutdownBeforeRun checks the documented ordering is now enforced in code: a Tunnel that
+// was shut down before any Run never serves, and never panics.
+func TestShutdownBeforeRun(t *testing.T) {
+	srv, err := New(config.Config{Secret: "s3cret", Cipher: config.CipherAES}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
 	}
 
-	wg.Wait()
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown before run: %v", err)
+	}
+
+	// Idempotent: a second Shutdown is a no-op, not a panic.
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatalf("second shutdown: %v", err)
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	if err := srv.acceptLoop(context.Background(), ln, func(net.Conn) {}); err == nil {
+		t.Fatal("acceptLoop after shutdown returned nil, want error")
+	}
+
+	if err := srv.RunServer(context.Background()); err == nil {
+		t.Fatal("RunServer after shutdown returned nil, want error")
+	}
+}
+
+// TestShutdownBeforeRunClient is the client-side counterpart: a shut-down client refuses to run.
+func TestShutdownBeforeRunClient(t *testing.T) {
+	cli, err := New(config.Config{Secret: "s3cret", Cipher: config.CipherAES, Remote: "127.0.0.1:465"}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := cli.Shutdown(context.Background()); err != nil {
+		t.Fatalf("shutdown before run: %v", err)
+	}
+
+	if err := cli.RunClient(context.Background()); err == nil {
+		t.Fatal("RunClient after shutdown returned nil, want error")
+	}
+}
+
+// TestSpawnDroppedAfterShutdown checks a handler raced in after Shutdown is dropped instead of
+// tripping the WaitGroup misuse panic and instead of running unwaited.
+func TestSpawnDroppedAfterShutdown(t *testing.T) {
+	srv, err := New(config.Config{Secret: "s3cret", Cipher: config.CipherAES}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := srv.Shutdown(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ran := make(chan struct{})
+	if srv.spawn(func() { close(ran) }) {
+		t.Fatal("spawn after shutdown reported true, want false")
+	}
+
+	if srv.Active() != 0 {
+		t.Fatalf("Active = %d after dropped spawn, want 0", srv.Active())
+	}
+
+	select {
+	case <-ran:
+		t.Fatal("spawned handler ran after shutdown")
+	default:
+	}
+}
+
+// TestMaxStreamsRefused checks the per-session cap: streams beyond MaxStreams are closed at
+// once instead of hanging until the client deadline.
+func TestMaxStreamsRefused(t *testing.T) {
+	p := newPair(t, config.Config{})
+	p.srv.cfg.MaxStreams = 2
+
+	echo := echoListener(t)
+
+	held := make([]io.ReadWriteCloser, 0, 2)
+	for i := 0; i < 2; i++ {
+		s := socksConnect(t, p.cli, echo.Addr())
+		defer s.Close()
+		held = append(held, s)
+	}
+
+	// The server opens the third stream and closes it in the same accept iteration, so by the
+	// time the request reaches the relay the stream is already gone.
+	s, err := p.cli.openStream(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if _, err := s.Write([]byte{5, 1, 0}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.ReadFull(s, make([]byte, 2)); err == nil {
+		t.Fatal("third stream succeeded past MaxStreams, want refusal")
+	}
 }
 
 // TestStreamIsolation checks that a stream nobody reads does not block other streams in the

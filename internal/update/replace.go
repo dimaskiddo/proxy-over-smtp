@@ -54,8 +54,8 @@ func replace(exe string, bin []byte) error {
 	}
 
 	if runtime.GOOS == "windows" {
-		if err := os.Rename(exe, exe+oldSuffix); err != nil {
-			return wrapPerm(fmt.Errorf("move old binary aside: %w", err))
+		if err := moveAside(exe); err != nil {
+			return err
 		}
 	}
 
@@ -77,6 +77,22 @@ func replace(exe string, bin []byte) error {
 // still be locked by a running process.
 func cleanOld(exe string) {
 	_ = os.Remove(exe + oldSuffix)
+}
+
+// moveAside renames the running executable out of the way. A leftover .old that cleanOld could
+// not remove makes the first rename fail, so that case removes the stale file and retries once;
+// otherwise a second consecutive update would never succeed.
+func moveAside(exe string) error {
+	err := os.Rename(exe, exe+oldSuffix)
+	if err == nil || !errors.Is(err, fs.ErrExist) {
+		return wrapPerm(fmt.Errorf("move old binary aside: %w", err))
+	}
+
+	if rmErr := os.Remove(exe + oldSuffix); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+		return wrapPerm(fmt.Errorf("move old binary aside: %w", err))
+	}
+
+	return wrapPerm(fmt.Errorf("move old binary aside: %w", os.Rename(exe, exe+oldSuffix)))
 }
 
 // wrapPerm adds a hint to permission errors, the usual failure when the binary sits in a

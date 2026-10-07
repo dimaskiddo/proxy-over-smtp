@@ -1,6 +1,8 @@
 # Proxy-Over-SMTP — Agent Instructions
 
-SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with XOR-obfuscated smux multiplexing, to disguise traffic from Deep Packet Inspection (DPI). Never guess protocol behavior — ask when ambiguous.
+SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with a selectable XOR or AES-256-GCM stream over smux multiplexing. Never guess protocol behavior — ask when ambiguous.
+
+> **Research purposes only.** This project exists to study tunneling, obfuscation and stream-cipher design. It is not built, tested or supported for production, commercial or operational use. Run it only on systems you own or are explicitly authorised to test, and obey the law where you are.
 
 ---
 
@@ -27,24 +29,25 @@ SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with XOR-ob
 | **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `assetName` mirrors `.goreleaser.yml` archive names |
-| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial. `Shutdown(ctx)` drains. `mux.go`: smux config. `socket*.go`: fixed socket options (buffers, reuse, keepalive), per-OS |
+| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session (one dial at a time), SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial, per-session stream cap (`--max-streams`, default 128). Handshake lines capped at 4KB. `Shutdown(ctx)` drains; `spawn` and `Shutdown` share a lock so no handler starts mid-drain, and `RunServer`/`RunClient` after `Shutdown` return an error. `handshake.go`: challenge-response + key derivation + capped line reads. `cipher.go`: XOR/AES stream selection. `mux.go`: smux config. `socket*.go`: fixed socket options (buffers, reuse, keepalive), per-OS |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
 | **SOCKS4** | `pkg/socks4/` — SOCKS4/4a request parser and reply writer (CONNECT only) |
 | **HTTP proxy** | `pkg/httpproxy/` — CONNECT and absolute-form parser, status writer, forwarder |
 | **Relay** | `pkg/relay/` — bidirectional copy with pooled 32KB buffers |
 | **XOR Stream** | `pkg/xorstream/` — rolling-key XOR `io.ReadWriter` wrapper (obfuscation only) |
+| **AES Stream** | `pkg/aesstream/` — AES-256-GCM record `io.ReadWriter` wrapper (confidentiality and integrity) |
 
 ## CLI
 
 ```
 proxy-over-smtp [--log-level info] [--log-format text] [--log-file ""] <command>
-  server   --listen 0.0.0.0:465  --secret S [--allow-private] [--drain-timeout 30s]
-  client   --listen 0.0.0.0:1080 --remote 127.0.0.1:465 --secret S [--tls-cert C --tls-key K] [--drain-timeout 30s]
+  server   --listen 0.0.0.0:465  --secret S [--cipher aes] [--max-streams 128] [--allow-private] [--drain-timeout 30s] [--auto-update [--update-interval 24h]]
+  client   --listen 0.0.0.0:1080 --remote 127.0.0.1:465 --secret S [--cipher aes] [--max-streams 128] [--tls-cert C --tls-key K] [--drain-timeout 30s] [--auto-update [--update-interval 24h]]
   update   [--check] [--force]
   version  (also --version)
 ```
 
-Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_` (e.g. `PROXY_OVER_SMTP_SECRET`). Precedence: flag > env > default. The secret has no default.
+Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_` (e.g. `PROXY_OVER_SMTP_SECRET`), including the hidden `--update-api`. Precedence: flag > env > default. The secret has no default. `--cipher` is `xor` or `aes` (default) and must match on both ends. `--listen` and `--remote` are validated as `host:port` at startup.
 
 ---
 
@@ -59,7 +62,7 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 
 ### Wire Compatibility
 - Changing archive names in `.goreleaser.yml` requires updating `assetName` in `internal/update/update.go`, or `update` breaks.
-- Handshake, XOR, or smux changes must land in client and server together. Old and new binaries do not interoperate — say so in the commit message.
+- Handshake, cipher (XOR or AES), or smux changes must land in client and server together. Old and new binaries do not interoperate — say so in the commit message.
 
 ### Context & Concurrency
 - `context.Context` first param of long-running functions. Graceful shutdown: signal cancels the run context (stop accepting), then `Tunnel.Shutdown` drains up to `--drain-timeout`. A second signal forces.
@@ -114,14 +117,15 @@ proxy-over-smtp/
 ├── internal/
 │   ├── cli/              # Cobra commands, env fallback, slog
 │   ├── config/           # Config + Validate
-│   ├── tunnel/           # Client, server, smux config
+│   ├── tunnel/           # Client, server, handshake, cipher, smux config
 │   └── update/           # Self-update: release lookup, verify, replace, re-exec
 ├── pkg/
 │   ├── relay/            # Bidirectional pipe
 │   ├── httpproxy/        # HTTP proxy request parser, forwarder (+ test)
 │   ├── socks4/           # SOCKS4/4a parser (+ test)
 │   ├── socks5/           # SOCKS5 server negotiation
-│   └── xorstream/        # XOR stream (+ test)
+│   ├── xorstream/        # XOR stream (+ test)
+│   └── aesstream/        # AES-256-GCM stream (+ test)
 ├── docs/
 │   ├── ARCHITECTURE.md   # Module map, handshake, transport stack, design decisions
 │   └── WORKFLOWS.md      # Pipeline flows, error recovery
@@ -147,4 +151,4 @@ proxy-over-smtp/
 | `Makefile` | Build targets |
 | `.goreleaser.yml` | Release config (darwin/linux/windows × 386/amd64/arm64) |
 | `internal/tunnel/` | Client and server implementation |
-| `pkg/` | Reusable SOCKS4/5, HTTP proxy, relay, XOR stream |
+| `pkg/` | Reusable SOCKS4/5, HTTP proxy, relay, XOR and AES streams |

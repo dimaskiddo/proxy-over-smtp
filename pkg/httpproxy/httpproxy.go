@@ -88,11 +88,14 @@ func Forward(dst io.Writer, req *http.Request) error {
 	return nil
 }
 
-// withPort appends def when hostport has no port. Bare IPv6 literals lose their brackets first.
+// withPort appends def when hostport has no port. One bracket pair around a bare IPv6 literal is
+// removed first, so the result joins back into a valid host:port.
 func withPort(hostport, def string) string {
 	if _, _, err := net.SplitHostPort(hostport); err == nil {
 		return hostport
 	}
 
-	return net.JoinHostPort(strings.Trim(hostport, "[]"), def)
+	host := strings.TrimSuffix(strings.TrimPrefix(hostport, "["), "]")
+
+	return net.JoinHostPort(host, def)
 }

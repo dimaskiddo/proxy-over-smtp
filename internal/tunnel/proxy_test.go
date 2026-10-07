@@ -158,7 +158,7 @@ func TestProtocols(t *testing.T) {
 
 func TestBlockedTarget(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
-	srv, err := New(config.Config{Secret: "s3cret"}, log)
+	srv, err := New(config.Config{Secret: "s3cret", Cipher: config.CipherAES}, log)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,7 +178,7 @@ func TestBlockedTarget(t *testing.T) {
 		_ = srv.Shutdown(sctx)
 	}()
 
-	cli, err := New(config.Config{Secret: "s3cret", Remote: ln.Addr().String()}, log)
+	cli, err := New(config.Config{Secret: "s3cret", Cipher: config.CipherAES, Remote: ln.Addr().String()}, log)
 	if err != nil {
 		t.Fatal(err)
 	}

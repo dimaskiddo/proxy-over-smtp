@@ -3,13 +3,15 @@
 FROM golang:1.25-alpine AS go-builder
 
 ARG VERSION="dev"
+ARG COMMIT="none"
+ARG DATE="unknown"
 
 WORKDIR /usr/src/app
 
 COPY . ./
 
 RUN go mod download \
-    && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -trimpath -a -o main ./cmd/proxy-over-smtp
+    && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}" -trimpath -a -o main ./cmd/proxy-over-smtp
 
 
 # Final Image

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/subtle"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -22,7 +22,6 @@ import (
 	"github.com/dimaskiddo/proxy-over-smtp/pkg/relay"
 	"github.com/dimaskiddo/proxy-over-smtp/pkg/socks4"
 	"github.com/dimaskiddo/proxy-over-smtp/pkg/socks5"
-	"github.com/dimaskiddo/proxy-over-smtp/pkg/xorstream"
 )
 
 // errBlocked marks a dial refused by the target ACL so replies can map it to "not allowed".
@@ -52,14 +51,16 @@ func (t *Tunnel) RunServer(ctx context.Context) error {
 // in-flight transfers finish while an idle session goes away at once.
 func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 	reader := bufio.NewReader(conn)
-	if err := t.serverHandshake(conn, reader); err != nil {
+
+	nonce, err := t.serverHandshake(conn, reader)
+	if err != nil {
 		t.log.Debug("handshake rejected", "peer", conn.RemoteAddr().String(), "err", err)
 		return
 	}
 
 	peer := conn.RemoteAddr()
 
-	stream, err := xorstream.New(&bufConn{r: reader, Conn: conn}, t.cfg.Secret)
+	stream, err := t.wrapStream(&bufConn{r: reader, Conn: conn}, nonce, true)
 	if err != nil {
 		t.log.Warn("session setup failed", "peer", peer.String(), "err", err)
 		return
@@ -120,9 +121,21 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 
 		mu.Lock()
 		open++
+		over := open > t.cfg.MaxStreams
 		mu.Unlock()
 
-		t.spawn(func() {
+		// Refuse over the cap instead of queueing, so one peer cannot hold unbounded handlers.
+		if over {
+			mu.Lock()
+			open--
+			mu.Unlock()
+
+			t.log.Debug("stream refused", "peer", peer.String(), "open", open, "max", t.cfg.MaxStreams)
+			vs.Close()
+			continue
+		}
+
+		if !t.spawn(func() {
 			defer func() {
 				mu.Lock()
 				open--
@@ -133,7 +146,15 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 			defer vs.Close()
 
 			t.handleStream(sctx, peer, vs)
-		})
+		}) {
+			// Shutdown started between the cap check and the spawn: give the stream back.
+			mu.Lock()
+			open--
+			mu.Unlock()
+
+			vs.Close()
+			return
+		}
 	}
 }
 
@@ -247,49 +268,55 @@ func (t *Tunnel) replyFailure(vs *smux.Stream, proto string, err error) {
 	}
 }
 
-// serverHandshake plays the server side of the fake SMTP session and checks the EHLO line
-// against the secret in constant time. Any failure closes the connection without a reply.
-func (t *Tunnel) serverHandshake(conn net.Conn, r *bufio.Reader) error {
+// serverHandshake plays the server side of the fake SMTP session. It sends a fresh nonce,
+// verifies the client's HMAC proof against the secret in constant time, and returns the nonce so
+// the caller can derive the stream keys. Any failure closes the connection with no reply.
+func (t *Tunnel) serverHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error) {
 	if err := conn.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
-		return fmt.Errorf("set deadline: %w", err)
+		return nil, fmt.Errorf("set deadline: %w", err)
 	}
 
-	if _, err := fmt.Fprintf(conn, "220 mail.google.com ESMTP\r\n"); err != nil {
-		return fmt.Errorf("write 220: %w", err)
-	}
-
-	line, err := r.ReadString('\n')
+	nonce, err := newNonce()
 	if err != nil {
-		return fmt.Errorf("read ehlo: %w", err)
+		return nil, err
 	}
 
-	want := "EHLO " + t.cfg.Secret
-	if subtle.ConstantTimeCompare([]byte(strings.TrimRight(line, "\r\n")), []byte(want)) != 1 {
-		return errors.New("invalid ehlo")
+	if _, err := fmt.Fprintf(conn, "220 mail.google.com ESMTP %s\r\n", base64.StdEncoding.EncodeToString(nonce)); err != nil {
+		return nil, fmt.Errorf("write 220: %w", err)
+	}
+
+	line, err := readLine(r, maxLine)
+	if err != nil {
+		return nil, fmt.Errorf("read ehlo: %w", err)
+	}
+
+	want := "EHLO " + proofValue(t.cfg.Secret, nonce)
+	if subtle.ConstantTimeCompare([]byte(line), []byte(want)) != 1 {
+		return nil, errAuth
 	}
 
 	if _, err := fmt.Fprintf(conn, "250-OK\r\n250 STARTTLS\r\n"); err != nil {
-		return fmt.Errorf("write 250: %w", err)
+		return nil, fmt.Errorf("write 250: %w", err)
 	}
 
-	line, err = r.ReadString('\n')
+	line, err = readLine(r, maxLine)
 	if err != nil {
-		return fmt.Errorf("read data: %w", err)
+		return nil, fmt.Errorf("read data: %w", err)
 	}
 
-	if strings.TrimRight(line, "\r\n") != "DATA" {
-		return errors.New("invalid data command")
+	if line != "DATA" {
+		return nil, errors.New("invalid data command")
 	}
 
 	if _, err := fmt.Fprintf(conn, "354 Go ahead\r\n"); err != nil {
-		return fmt.Errorf("write 354: %w", err)
+		return nil, fmt.Errorf("write 354: %w", err)
 	}
 
 	if err := conn.SetDeadline(time.Time{}); err != nil {
-		return fmt.Errorf("clear deadline: %w", err)
+		return nil, fmt.Errorf("clear deadline: %w", err)
 	}
 
-	return nil
+	return nonce, nil
 }
 
 // dialControl refuses blocked target addresses unless AllowPrivate is set. It runs after DNS
@@ -311,13 +338,33 @@ func (t *Tunnel) dialControl(_, address string, _ syscall.RawConn) error {
 	return nil
 }
 
-// isBlocked reports whether a is loopback, private, link-local, multicast or unspecified.
-// It uses stdlib predicates only, so ranges such as CGNAT 100.64.0.0/10 are not covered.
+// nonPublicPrefixes lists ranges the stdlib predicates do not cover but that are still not public
+// unicast: CGNAT, the rest of 0.0.0.0/8 (often loopback-routed), IETF protocol assignments and
+// the reserved block. Without them those targets would pass the ACL.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+}
+
+// isBlocked reports whether a is loopback, private, link-local, multicast or unspecified, or
+// falls in a reserved prefix the stdlib predicates leave out.
 func isBlocked(a netip.Addr) bool {
 	a = a.Unmap()
 
-	return a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
-		a.IsLinkLocalMulticast() || a.IsMulticast() || a.IsUnspecified()
+	if a.IsLoopback() || a.IsPrivate() || a.IsLinkLocalUnicast() ||
+		a.IsLinkLocalMulticast() || a.IsMulticast() || a.IsUnspecified() {
+		return true
+	}
+
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // replyCode maps a dial error to the closest SOCKS5 reply code.

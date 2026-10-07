@@ -15,24 +15,36 @@ type rw struct {
 // Write records p so tests can inspect the reply.
 func (r *rw) Write(p []byte) (int, error) { return r.out.Write(p) }
 
+// selectNoAuth is the method-selection reply for a greeting that offers no-auth.
+var selectNoAuth = []byte{5, 0}
+
+// failReply is the full failure reply written when a request is rejected after the greeting.
+var failReply = []byte{5, GeneralFailure, 0, 1, 0, 0, 0, 0, 0, 0}
+
 func TestReadRequest(t *testing.T) {
 	tests := []struct {
-		name      string
-		in        []byte
-		want      string
-		wantErr   bool
-		wantReply []byte
+		name    string
+		in      []byte
+		want    string
+		wantErr bool
+		// wantOut is the exact byte stream ReadRequest wrote back, which is what the peer sees.
+		wantOut []byte
 	}{
-		{"ipv4", []byte{5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 0, 80}, "1.2.3.4:80", false, []byte{5, 0}},
-		{"ipv6", append([]byte{5, 1, 0, 5, 1, 0, 4}, append(net.ParseIP("::1"), 0x01, 0xbb)...), "[::1]:443", false, []byte{5, 0}},
-		{"domain", append([]byte{5, 1, 0, 5, 1, 0, 3, 3}, []byte("a.b\x00\x50")...), "a.b:80", false, []byte{5, 0}},
+		{"ipv4", []byte{5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 0, 80}, "1.2.3.4:80", false, selectNoAuth},
+		{"ipv6", append([]byte{5, 1, 0, 5, 1, 0, 4}, append(net.ParseIP("::1"), 0x01, 0xbb)...), "[::1]:443", false, selectNoAuth},
+		{"domain", append([]byte{5, 1, 0, 5, 1, 0, 3, 3}, []byte("a.b\x00\x50")...), "a.b:80", false, selectNoAuth},
 		{"bad version", []byte{4, 1, 0}, "", true, nil},
 		{"no-auth not offered", []byte{5, 1, 2}, "", true, []byte{5, 0xFF}},
-		{"bind cmd", []byte{5, 1, 0, 5, 2, 0, 1, 1, 2, 3, 4, 0, 80}, "", true, []byte{5, 0}},
-		{"bad atyp", []byte{5, 1, 0, 5, 1, 0, 9}, "", true, []byte{5, 0}},
-		{"empty domain", []byte{5, 1, 0, 5, 1, 0, 3, 0}, "", true, []byte{5, 0}},
-		{"truncated", []byte{5, 1, 0, 5, 1, 0, 1, 1, 2}, "", true, []byte{5, 0}},
-		{"truncated methods", []byte{5, 3, 0}, "", true, nil},
+		{"bind cmd", []byte{5, 1, 0, 5, 2, 0, 1, 1, 2, 3, 4, 0, 80}, "", true, append(selectNoAuth, 5, CommandNotSupported, 0, 1, 0, 0, 0, 0, 0, 0)},
+		{"bad atyp", []byte{5, 1, 0, 5, 1, 0, 9}, "", true, append(selectNoAuth, 5, AddrTypeNotSupported, 0, 1, 0, 0, 0, 0, 0, 0)},
+		{"empty domain", []byte{5, 1, 0, 5, 1, 0, 3, 0}, "", true, append(selectNoAuth, failReply...)},
+		{"bad version in request", []byte{5, 1, 0, 4, 1, 0, 1}, "", true, append(selectNoAuth, failReply...)},
+		{"truncated greeting", []byte{5}, "", true, nil},
+		{"truncated methods", []byte{5, 3, 0}, "", true, failReply},
+		{"truncated request", []byte{5, 1, 0, 5, 1}, "", true, append(selectNoAuth, failReply...)},
+		{"truncated ipv4", []byte{5, 1, 0, 5, 1, 0, 1, 1, 2}, "", true, append(selectNoAuth, failReply...)},
+		{"truncated domain", []byte{5, 1, 0, 5, 1, 0, 3, 3, 'a'}, "", true, append(selectNoAuth, failReply...)},
+		{"truncated port", []byte{5, 1, 0, 5, 1, 0, 1, 1, 2, 3, 4, 0}, "", true, append(selectNoAuth, failReply...)},
 	}
 
 	for _, tt := range tests {
@@ -47,8 +59,8 @@ func TestReadRequest(t *testing.T) {
 				t.Fatalf("got %q want %q", got, tt.want)
 			}
 
-			if !bytes.HasPrefix(c.out.Bytes(), tt.wantReply) {
-				t.Fatalf("reply %v, want prefix %v", c.out.Bytes(), tt.wantReply)
+			if !bytes.Equal(c.out.Bytes(), tt.wantOut) {
+				t.Fatalf("reply %v, want %v", c.out.Bytes(), tt.wantOut)
 			}
 		})
 	}

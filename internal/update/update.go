@@ -18,6 +18,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DefaultAPI is the GitHub latest-release endpoint.
@@ -64,7 +65,8 @@ func (c Client) get(ctx context.Context, url, accept string, limit int64) ([]byt
 
 	hc := c.HTTP
 	if hc == nil {
-		hc = http.DefaultClient
+		// A nil client must still bound its request, or a stuck server hangs the caller forever.
+		hc = &http.Client{Timeout: 2 * time.Minute}
 	}
 
 	resp, err := hc.Do(req)

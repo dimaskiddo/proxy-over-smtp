@@ -85,6 +85,29 @@ func TestForward(t *testing.T) {
 	}
 }
 
+func TestWithPort(t *testing.T) {
+	tests := []struct {
+		hostport string
+		want     string
+	}{
+		{"example.com", "example.com:443"},
+		{"example.com:8443", "example.com:8443"},
+		{"[2001:db8::1]", "[2001:db8::1]:443"},
+		{"[2001:db8::1]:8443", "[2001:db8::1]:8443"},
+		{"2001:db8::1", "[2001:db8::1]:443"},
+		// A double bracket is malformed; it must stay fail-closed rather than become a valid host.
+		{"[[2001:db8::1]]", "[[2001:db8::1]]:443"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.hostport, func(t *testing.T) {
+			if got := withPort(tt.hostport, "443"); got != tt.want {
+				t.Fatalf("withPort(%q) = %q, want %q", tt.hostport, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestWriteStatus(t *testing.T) {
 	tests := []struct {
 		code int
