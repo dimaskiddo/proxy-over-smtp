@@ -1,4 +1,8 @@
 BUILD_CGO_ENABLED  := 0
+VERSION            ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT             ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+DATE               ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS            := -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 SERVICE_NAME       := proxy-over-smtp
 REBASE_URL         := "github.com/dimaskiddo/proxy-over-smtp"
 COMMIT_MSG         := "update improvement"
@@ -33,12 +37,12 @@ publish:
 
 build:
 	make vendor
-	CGO_ENABLED=$(BUILD_CGO_ENABLED) go build -ldflags="-s -w" -trimpath -a -o $(SERVICE_NAME) ./cmd/proxy-over-smtp
+	CGO_ENABLED=$(BUILD_CGO_ENABLED) go build -ldflags="$(LDFLAGS)" -trimpath -a -o $(SERVICE_NAME) ./cmd/proxy-over-smtp
 	echo "Build '$(SERVICE_NAME)' complete."
 
 run:
 	make vendor
-	go run ./cmd/proxy-over-smtp
+	go run ./cmd/proxy-over-smtp $(ARGS)
 
 clean-dist:
 	rm -rf dist

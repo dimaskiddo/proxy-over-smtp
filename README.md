@@ -6,6 +6,26 @@ A **client** exposes a local SOCKS5 port. A **server** answers a fake SMTP hands
 
 ---
 
+## ⚠️ Breaking Changes
+
+The command line changed completely. Old command lines no longer work: Cobra rejects single-dash long flags such as `-secret` and `-mode`. Update every service unit, Docker command and script before upgrading.
+
+| Before | Now |
+|---|---|
+| `-mode server` | `server` subcommand |
+| `-mode client` | `client` subcommand |
+| `-server ADDR` | `server --listen ADDR` |
+| `-client ADDR` | `client --listen ADDR` |
+| `-remote ADDR` | `client --remote ADDR` |
+| `-secret X` (default `THIS_IS_YOUR_SECRET_WORD`) | `--secret X` or env `PROXY_OVER_SMTP_SECRET`. **Required, no default.** |
+| `-log-file PATH` (default `./proxy-over-smtp.log`) | `--log-file PATH`. **Off by default**, logs go to stdout only |
+| `AUDIT: ...` plain text lines | `slog` structured lines (`--log-format text` or `json`) |
+| `-allow-private` | `server --allow-private` |
+
+**Client and server must be upgraded together.** The tunnel now uses smux protocol v2 (per-stream flow control), so old and new binaries do not interoperate.
+
+---
+
 ## ✨ Why Proxy-Over-SMTP?
 
 *   **🎭 SMTP Disguise:** Every connection opens with a plausible `220` / `EHLO` / `DATA` exchange before tunneling starts.
@@ -13,7 +33,8 @@ A **client** exposes a local SOCKS5 port. A **server** answers a fake SMTP hands
 *   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
 *   **🧦 Standard SOCKS5:** Works with browsers, `curl`, and anything that speaks SOCKS5 (IPv4, IPv6 and domain targets).
 *   **🛑 Graceful Shutdown:** Active connections drain on `SIGINT` / `SIGTERM` (5s limit).
-*   **📝 Audit Log:** Every tunnel (`peer -> target`) logged to stdout and file.
+*   **📝 Structured Logs:** `slog` events on stdout (text or JSON), one `tunnel opened` line per proxied connection. Optional log file.
+*   **🌱 Twelve-Factor:** All settings from flags or `PROXY_OVER_SMTP_*` env vars. The secret has no default.
 *   **📦 Static Binaries:** `CGO_ENABLED=0` builds for Linux, macOS, and Windows, plus a Docker image.
 
 ---
@@ -51,44 +72,51 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/WORKFLOWS.md](docs/WO
     ```sh
     docker run -d \
       -p 465:465 \
+      -e PROXY_OVER_SMTP_SECRET="change-me" \
       --name proxy-over-smtp-server \
       --rm dimaskiddo/proxy-over-smtp:latest \
-      proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
+      server --listen 0.0.0.0:465
     ```
 3.  **Run the client side:**
     ```sh
     docker run -d \
       -p 1080:1080 \
+      -e PROXY_OVER_SMTP_SECRET="change-me" \
       --name proxy-over-smtp-client \
       --rm dimaskiddo/proxy-over-smtp:latest \
-      proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+      client --listen 0.0.0.0:1080 --remote 192.168.1.100:465
     ```
 4.  Point your browser to SOCKS version 5 at `127.0.0.1:1080` (or your client port).
+
+The image entrypoint is `proxy-over-smtp` and the default command is `server`.
 
 ### 📦 **Using Pre-Built Binaries**
 
 1.  Download the latest release from the [Releases Page](https://github.com/dimaskiddo/proxy-over-smtp/releases) and extract it.
-2.  **Run server and client:**
+2.  **Run server and client** (set the secret in the environment so it stays out of `ps` and shell history):
 
 #### 🐧 **Linux / 🍎 macOS**
 ```sh
 chmod 755 proxy-over-smtp
+export PROXY_OVER_SMTP_SECRET="change-me"
 
 # Server
-./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
+./proxy-over-smtp server --listen 0.0.0.0:465
 
 # Client
-./proxy-over-smtp -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+./proxy-over-smtp client --listen 0.0.0.0:1080 --remote 192.168.1.100:465
 ```
 
 #### 🪟 **Windows**
-*(Double click or use PowerShell)*
+*(PowerShell)*
 ```powershell
+$env:PROXY_OVER_SMTP_SECRET = "change-me"
+
 # Server
-.\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode server -server "0.0.0.0:465"
+.\proxy-over-smtp.exe server --listen 0.0.0.0:465
 
 # Client
-.\proxy-over-smtp.exe -secret "THIS_IS_YOUR_SECRET_WORD" -mode client -client "0.0.0.0:1080" -remote "192.168.1.100:465"
+.\proxy-over-smtp.exe client --listen 0.0.0.0:1080 --remote 192.168.1.100:465
 ```
 
 ### 🏗️ **Build From Source**
@@ -98,7 +126,7 @@ git clone -b master https://github.com/dimaskiddo/proxy-over-smtp.git
 cd proxy-over-smtp
 
 make vendor    # Pull vendor packages
-make run       # Run from source
+make run ARGS="server --secret change-me"   # Run from source
 make build     # Build binary for this platform
 make release   # (Optional) Mass binaries via GoReleaser, output in dist/
 ```
@@ -107,17 +135,25 @@ make release   # (Optional) Mass binaries via GoReleaser, output in dist/
 
 ## 🕹️ Usage
 
-Server and client use the same binary. The same `-secret` must be set on both sides.
+```
+proxy-over-smtp <command> [flags]
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `-mode` | `server` | `server` or `client` |
-| `-server` | `0.0.0.0:465` | Server listen address |
-| `-client` | `0.0.0.0:1080` | Client SOCKS5 listen address |
-| `-remote` | `127.0.0.1:465` | Server address the client dials |
-| `-secret` | `THIS_IS_YOUR_SECRET_WORD` | Shared secret (EHLO token and XOR key). Must not be empty. **Change it.** |
-| `-allow-private` | `false` | Server: allow targets in loopback, private and link-local ranges (blocked by default) |
-| `-log-file` | `./proxy-over-smtp.log` | Audit log path |
+  server    Run the tunnel server
+  client    Run the local SOCKS5 client
+  version   Print version information (also --version)
+```
+
+Server and client use the same binary and the same secret. Every flag can also be set through an environment variable named `PROXY_OVER_SMTP_` plus the flag name in upper case with `-` as `_`. Precedence: flag, then env, then default.
+
+| Flag | Env | Default | Commands | Purpose |
+|---|---|---|---|---|
+| `--listen` | `PROXY_OVER_SMTP_LISTEN` | server `0.0.0.0:465`, client `0.0.0.0:1080` | server, client | Listen address |
+| `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address the client dials |
+| `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Shared secret (EHLO token and XOR key). Prefer the env var |
+| `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback, private and link-local targets (blocked by default) |
+| `--log-level` | `PROXY_OVER_SMTP_LOG_LEVEL` | `info` | all | `debug`, `info`, `warn`, `error` |
+| `--log-format` | `PROXY_OVER_SMTP_LOG_FORMAT` | `text` | all | `text` or `json` |
+| `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file |
 
 Quick check through the client:
 
@@ -125,9 +161,16 @@ Quick check through the client:
 curl --socks5-hostname 127.0.0.1:1080 https://example.com
 ```
 
-### 📁 Log Files
+### 📁 Logs
 
-Audit lines go to stdout and the `-log-file` file with an `AUDIT:` prefix, for example `Tunnel: <client-ip:port> -> <target:port>`, `Failed to Reach <target:port>: <error>`, `Shutdown Complete`.
+Logs are an event stream on stdout. Redirect or collect them with your process manager (Docker, systemd, Kubernetes). `--log-file` additionally appends to a file.
+
+```
+time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113.5:56810 target=example.com:443
+time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" target=10.0.0.1:80 err="dial tcp 10.0.0.1:80: target address not allowed"
+```
+
+`--log-format json` emits the same events as JSON lines. Handshake and SOCKS rejections appear at `--log-level debug`. The secret is never logged.
 
 ---
 
@@ -158,6 +201,7 @@ See also the list of [contributors](https://github.com/dimaskiddo/proxy-over-smt
 
 *   **[Go](https://golang.org/)**
 *   **[xtaci/smux](https://github.com/xtaci/smux)** - Stream multiplexer
+*   **[spf13/cobra](https://github.com/spf13/cobra)** - CLI framework
 *   **[GoReleaser](https://github.com/goreleaser/goreleaser)** - Automated binaries build
 *   **[Make](https://www.gnu.org/software/make/)** - Automated execution
 *   **[Docker](https://www.docker.com/)** - Containerization

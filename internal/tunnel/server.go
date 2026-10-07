@@ -22,37 +22,45 @@ import (
 var errBlocked = errors.New("target address not allowed")
 
 func (t *Tunnel) RunServer(ctx context.Context) error {
-	ln, err := net.Listen("tcp", t.cfg.ServerListenAddr)
+	ln, err := net.Listen("tcp", t.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen server: %w", err)
 	}
 
-	t.log.Printf("Server Listening on %s", t.cfg.ServerListenAddr)
+	t.log.Info("server listening", "listen", t.cfg.Listen)
 
 	err = t.acceptLoop(ctx, ln, func(conn net.Conn) {
 		t.handleServer(ctx, conn)
 	})
 
-	t.log.Println("Shutting Down Server Listener...")
 	return err
 }
 
 func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 	reader := bufio.NewReader(conn)
 	if err := t.serverHandshake(conn, reader); err != nil {
+		t.log.Debug("handshake rejected", "peer", conn.RemoteAddr().String(), "err", err)
 		return
 	}
 
-	stream, err := xorstream.New(&bufConn{r: reader, Conn: conn}, t.cfg.AuthSecret)
+	peer := conn.RemoteAddr()
+
+	stream, err := xorstream.New(&bufConn{r: reader, Conn: conn}, t.cfg.Secret)
 	if err != nil {
+		t.log.Warn("session setup failed", "peer", peer.String(), "err", err)
 		return
 	}
 
 	sess, err := smux.Server(stream, muxConfig())
 	if err != nil {
+		t.log.Warn("session setup failed", "peer", peer.String(), "err", err)
 		return
 	}
 	defer sess.Close()
+
+	// Ends in-flight dials when the session dies.
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	for {
 		vs, err := sess.AcceptStream()
@@ -62,7 +70,7 @@ func (t *Tunnel) handleServer(ctx context.Context, conn net.Conn) {
 
 		t.conns.Go(func() {
 			defer vs.Close()
-			t.handleStream(ctx, conn.RemoteAddr(), vs)
+			t.handleStream(sctx, peer, vs)
 		})
 	}
 }
@@ -74,13 +82,14 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 
 	target, err := socks5.ReadRequest(vs)
 	if err != nil {
+		t.log.Debug("socks request rejected", "peer", peer.String(), "err", err)
 		return
 	}
 
 	d := net.Dialer{Timeout: defaultTimeout, Control: t.dialControl}
 	dest, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
-		t.log.Printf("Failed to Reach %s: %v", target, err)
+		t.log.Warn("target unreachable", "target", target, "err", err)
 		_ = socks5.WriteReply(vs, replyCode(err), nil)
 		return
 	}
@@ -94,7 +103,7 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 		return
 	}
 
-	t.log.Printf("Tunnel: %s -> %s", peer, target)
+	t.log.Info("tunnel opened", "peer", peer.String(), "target", target)
 	relay.Pipe(vs, dest)
 }
 
@@ -112,7 +121,7 @@ func (t *Tunnel) serverHandshake(conn net.Conn, r *bufio.Reader) error {
 		return fmt.Errorf("read ehlo: %w", err)
 	}
 
-	want := "EHLO " + t.cfg.AuthSecret
+	want := "EHLO " + t.cfg.Secret
 	if subtle.ConstantTimeCompare([]byte(strings.TrimRight(line, "\r\n")), []byte(want)) != 1 {
 		return errors.New("invalid ehlo")
 	}

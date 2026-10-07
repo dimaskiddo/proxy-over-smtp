@@ -2,12 +2,14 @@
 # ---------------------------------------------------
 FROM golang:1.25-alpine AS go-builder
 
+ARG VERSION="dev"
+
 WORKDIR /usr/src/app
 
 COPY . ./
 
 RUN go mod download \
-    && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -trimpath -a -o main ./cmd/proxy-over-smtp
+    && CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X main.version=${VERSION}" -trimpath -a -o main ./cmd/proxy-over-smtp
 
 
 # Final Image
@@ -25,4 +27,5 @@ RUN apk --no-cache --update upgrade
 
 COPY --from=go-builder /usr/src/app/main ./proxy-over-smtp
 
-CMD ["proxy-over-smtp"]
+ENTRYPOINT ["proxy-over-smtp"]
+CMD ["server"]

@@ -23,8 +23,9 @@ SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux mult
 
 | Component | Role |
 |---|---|
-| **Entry** | `cmd/proxy-over-smtp/` — wiring only: parse config, audit logger, signal context, run mode, graceful wait |
-| **Config** | `internal/config/` — CLI flags into `Config` struct, `Validate()` |
+| **Entry** | `cmd/proxy-over-smtp/` — wiring only: signal context, ldflags build info, `cli.Execute` |
+| **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`), env fallback, `slog` logger, graceful drain |
+| **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream SOCKS5 + dial. `mux.go`: smux config |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
 | **Relay** | `pkg/relay/` — bidirectional copy with pooled 32KB buffers |
@@ -33,15 +34,13 @@ SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux mult
 ## CLI
 
 ```
-proxy-over-smtp
-  -mode string      # 'server' (default) or 'client'
-  -server string    # Server listen address (default "0.0.0.0:465")
-  -client string    # Client listen address (default "0.0.0.0:1080")
-  -remote string    # Server address the client dials (default "127.0.0.1:465")
-  -secret string    # Shared secret: EHLO token + XOR key (default "THIS_IS_YOUR_SECRET_WORD")
-  -log-file string  # Audit log path (default "./proxy-over-smtp.log")
-  -allow-private    # Server: allow loopback/private/link-local targets (default false)
+proxy-over-smtp [--log-level info] [--log-format text] [--log-file ""] <command>
+  server   --listen 0.0.0.0:465  --secret S [--allow-private]
+  client   --listen 0.0.0.0:1080 --remote 127.0.0.1:465 --secret S
+  version  (also --version)
 ```
+
+Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_` (e.g. `PROXY_OVER_SMTP_SECRET`). Precedence: flag > env > default. The secret has no default.
 
 ---
 
@@ -66,7 +65,10 @@ proxy-over-smtp
 - Check every `io.ReadFull`, `Write`, and `SetDeadline` error.
 
 ### Logging
-- Injected `*log.Logger` is the audit log. No `log.Fatal` / `os.Exit` outside `cmd/`. Never log the secret.
+- Injected `*slog.Logger`, structured key/value fields, stdout event stream. Levels: `info` audit events, `warn` failures, `debug` rejections. No `log.Fatal` / `os.Exit` outside `cmd/`. Never log the secret.
+
+### Config
+- Twelve-factor: config only from flags and env, no baked-in secret, every new flag gets an env var automatically via `internal/cli/env.go`. No config files.
 
 ### I/O
 - Stream via `io.Reader` / `io.Writer`, reuse buffers with `sync.Pool`. Deadline on every handshake read.
@@ -103,7 +105,8 @@ Existing code violating the rules above. Fix only when asked.
 proxy-over-smtp/
 ├── cmd/proxy-over-smtp/  # Entry (main.go)
 ├── internal/
-│   ├── config/           # Flags -> Config
+│   ├── cli/              # Cobra commands, env fallback, slog
+│   ├── config/           # Config + Validate
 │   └── tunnel/           # Client, server, smux config
 ├── pkg/
 │   ├── relay/            # Bidirectional pipe
@@ -113,7 +116,7 @@ proxy-over-smtp/
 │   ├── ARCHITECTURE.md   # Module map, handshake, transport stack, design decisions
 │   └── WORKFLOWS.md      # Pipeline flows, error recovery
 ├── Makefile              # Build targets (build, run, release, publish, clean)
-├── .goreleaser.yml       # Cross-platform release config
+├── .goreleaser.yml       # Cross-platform release config, injects version ldflags
 ├── Dockerfile            # Multi-stage build
 ├── AGENTS.md             # Agent instructions (symlinks: CLAUDE.md, GEMINI.md)
 ├── README.md

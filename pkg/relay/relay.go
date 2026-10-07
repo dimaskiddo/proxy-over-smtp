@@ -14,20 +14,33 @@ var bufferPool = sync.Pool{
 	},
 }
 
-// Pipe copies both directions and returns when the first direction ends.
-func Pipe(conn1, conn2 io.ReadWriter) {
-	errCh := make(chan error, 2)
+// Pipe copies both directions. When either direction ends it closes both ends and
+// returns only after both copies have exited.
+func Pipe(a, b io.ReadWriteCloser) {
+	var once sync.Once
+	closeBoth := func() {
+		once.Do(func() {
+			_ = a.Close()
+			_ = b.Close()
+		})
+	}
+
+	var wg sync.WaitGroup
 
 	cp := func(dst io.Writer, src io.Reader) {
+		defer wg.Done()
+		defer closeBoth()
+
 		bp := bufferPool.Get().(*[]byte)
 		defer bufferPool.Put(bp)
 
-		_, err := io.CopyBuffer(dst, src, *bp)
-		errCh <- err
+		// Wrapping hides WriterTo/ReaderFrom, which would bypass the pooled buffer.
+		_, _ = io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bp)
 	}
 
-	go cp(conn1, conn2)
-	go cp(conn2, conn1)
+	wg.Add(2)
+	go cp(a, b)
+	go cp(b, a)
 
-	<-errCh
+	wg.Wait()
 }

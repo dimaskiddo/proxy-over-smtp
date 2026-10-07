@@ -15,18 +15,17 @@ import (
 )
 
 func (t *Tunnel) RunClient(ctx context.Context) error {
-	ln, err := net.Listen("tcp", t.cfg.ClientListenAddr)
+	ln, err := net.Listen("tcp", t.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen client: %w", err)
 	}
 
-	t.log.Printf("Client Listening on %s -> Tunnel to %s", t.cfg.ClientListenAddr, t.cfg.ClientRemoteAddr)
+	t.log.Info("client listening", "listen", t.cfg.Listen, "remote", t.cfg.Remote)
 
 	err = t.acceptLoop(ctx, ln, func(local net.Conn) {
 		t.handleClient(ctx, local)
 	})
 
-	t.log.Println("Shutting Down Client Listener...")
 	t.closeSession()
 
 	return err
@@ -45,7 +44,7 @@ func (t *Tunnel) closeSession() {
 func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 	remoteStream, err := t.openStream(ctx)
 	if err != nil {
-		t.log.Printf("Open Stream Failed: %v", err)
+		t.log.Warn("open stream failed", "err", err)
 		return
 	}
 	defer remoteStream.Close()
@@ -84,18 +83,26 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 	}
 
 	d := net.Dialer{Timeout: defaultTimeout}
-	remote, err := d.DialContext(ctx, "tcp", t.cfg.ClientRemoteAddr)
+	remote, err := d.DialContext(ctx, "tcp", t.cfg.Remote)
 	if err != nil {
 		return nil, fmt.Errorf("dial server: %w", err)
 	}
 
 	reader := bufio.NewReader(remote)
-	if err := t.clientHandshake(remote, reader); err != nil {
+
+	stop := context.AfterFunc(ctx, func() { remote.Close() })
+	err = t.clientHandshake(remote, reader)
+	if !stop() {
+		remote.Close()
+		return nil, fmt.Errorf("smtp handshake: %w", ctx.Err())
+	}
+
+	if err != nil {
 		remote.Close()
 		return nil, fmt.Errorf("smtp handshake: %w", err)
 	}
 
-	stream, err := xorstream.New(&bufConn{r: reader, Conn: remote}, t.cfg.AuthSecret)
+	stream, err := xorstream.New(&bufConn{r: reader, Conn: remote}, t.cfg.Secret)
 	if err != nil {
 		remote.Close()
 		return nil, fmt.Errorf("xor stream: %w", err)
@@ -125,7 +132,7 @@ func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) error {
 		return fmt.Errorf("unexpected greeting")
 	}
 
-	if _, err := fmt.Fprintf(conn, "EHLO %s\r\n", t.cfg.AuthSecret); err != nil {
+	if _, err := fmt.Fprintf(conn, "EHLO %s\r\n", t.cfg.Secret); err != nil {
 		return fmt.Errorf("write ehlo: %w", err)
 	}
 

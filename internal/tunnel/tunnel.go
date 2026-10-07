@@ -4,7 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net"
 	"sync"
 	"time"
@@ -23,14 +23,14 @@ const (
 
 type Tunnel struct {
 	cfg   config.Config
-	log   *log.Logger
+	log   *slog.Logger
 	conns sync.WaitGroup
 
 	sessMu sync.Mutex
 	sess   *smux.Session
 }
 
-func New(cfg config.Config, logger *log.Logger) *Tunnel {
+func New(cfg config.Config, logger *slog.Logger) *Tunnel {
 	return &Tunnel{cfg: cfg, log: logger}
 }
 
@@ -60,7 +60,7 @@ func (t *Tunnel) acceptLoop(ctx context.Context, ln net.Listener, handle func(ne
 				return nil
 			}
 
-			t.log.Printf("Accept Failed: %v", err)
+			t.log.Warn("accept failed", "err", err)
 
 			select {
 			case <-ctx.Done():

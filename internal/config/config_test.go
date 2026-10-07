@@ -8,11 +8,9 @@ func TestValidate(t *testing.T) {
 		cfg     Config
 		wantErr bool
 	}{
-		{"server", Config{Mode: "server", AuthSecret: "s"}, false},
-		{"client", Config{Mode: "client", AuthSecret: "s"}, false},
-		{"typo mode", Config{Mode: "clinet", AuthSecret: "s"}, true},
-		{"empty mode", Config{AuthSecret: "s"}, true},
-		{"empty secret", Config{Mode: "server"}, true},
+		{"ok", Config{Listen: ":1", Secret: "s"}, false},
+		{"empty secret", Config{Listen: ":1"}, true},
+		{"empty listen", Config{Secret: "s"}, true},
 	}
 
 	for _, tt := range tests {

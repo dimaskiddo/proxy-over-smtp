@@ -13,6 +13,7 @@ graph LR
     end
 
     subgraph internal["internal/"]
+        Cli["cli/<br/>root.go env.go log.go<br/>server.go client.go version.go"]
         Config["config/"]
         Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go mux.go"]
     end
@@ -24,14 +25,17 @@ graph LR
     end
 
     Smux["xtaci/smux"]
+    Cobra["spf13/cobra"]
 
-    Main --> Config
-    Main --> Tunnel
+    Main --> Cli
+    Cli --> Config
+    Cli --> Tunnel
     Tunnel --> Config
     Tunnel --> Socks5
     Tunnel --> Relay
     Tunnel --> Xor
     Tunnel --> Smux
+    Cli --> Cobra
 ```
 
 ---
@@ -59,8 +63,9 @@ sequenceDiagram
 
 | Component | Package | Role |
 |---|---|---|
-| **Entry** | `cmd/proxy-over-smtp/` | Parse config, build audit logger, signal context, pick mode, graceful wait |
-| **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, logger, connection `WaitGroup`, shared client session |
+| **Entry** | `cmd/proxy-over-smtp/` | Signal context, build info (ldflags), call `cli.Execute` |
+| **CLI** | `internal/cli/` | Cobra commands (`server`, `client`, `version`), env-to-flag fallback, `slog` logger, graceful drain |
+| **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, connection `WaitGroup`, shared client session |
 | **Client** | `internal/tunnel/client.go` | Local listener. Does **not** parse SOCKS: pipes raw local bytes into a new smux stream. Browser SOCKS5 handshake is therefore answered by the server |
 | **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream SOCKS5 + dial + relay |
 | **Mux** | `internal/tunnel/mux.go` | Shared smux config for both sides |
@@ -103,6 +108,9 @@ TCP
 | Setting | Value |
 |---|---|
 | Base | `smux.DefaultConfig()` |
+| `Version` | 2 (per-stream flow control) |
+| `MaxReceiveBuffer` | 16MB per session |
+| `MaxStreamBuffer` | 512KB per stream |
 | `KeepAliveDisabled` | `false` |
 | `KeepAliveInterval` | 15s |
 | `KeepAliveTimeout` | 60s |
@@ -118,29 +126,33 @@ TCP
 | Address types | IPv4 (`0x01`), domain (`0x03`, non-empty), IPv6 (`0x04`). Others: reply `0x08` |
 | Command | CONNECT only. Others: reply `0x07` |
 | Reply | Sent after the dial. Success carries the local bound address. Failures map to `0x02` blocked, `0x03` network, `0x04` host/DNS/timeout, `0x05` refused, `0x01` other |
-| Target ACL | Loopback, private, link-local, multicast and unspecified targets are refused after DNS resolution unless `-allow-private` is set |
+| Target ACL | Loopback, private, link-local, multicast and unspecified targets are refused after DNS resolution unless `--allow-private` is set |
 
 ---
 
 ## 5. Relay (`pkg/relay/relay.go`)
 
-Two `io.CopyBuffer` goroutines (one per direction) with 32KB buffers from a `sync.Pool`. `Pipe` returns when the first direction ends; callers then close both ends through `defer`, which stops the other copy.
+Two `io.CopyBuffer` goroutines (one per direction) with 32KB buffers from a `sync.Pool`. The reader and writer are wrapped so `WriterTo`/`ReaderFrom` fast paths cannot bypass the pool. When the first direction ends, `Pipe` closes both ends and returns only after both copies have exited.
 
 ---
 
-## 6. Configuration (`internal/config/config.go`)
+## 6. Configuration & Logging (`internal/cli/`, `internal/config/config.go`)
 
-| Flag | Default | Purpose |
-|---|---|---|
-| `-mode` | `server` | `server` or `client`, anything else fails at startup |
-| `-server` | `0.0.0.0:465` | Server listen address |
-| `-client` | `0.0.0.0:1080` | Client listen address |
-| `-remote` | `127.0.0.1:465` | Server address dialed by client |
-| `-secret` | `THIS_IS_YOUR_SECRET_WORD` | EHLO token and XOR key. Empty is rejected, default logs a warning |
-| `-allow-private` | `false` | Server: allow loopback/private/link-local targets |
-| `-log-file` | `./proxy-over-smtp.log` | Audit log path |
+Commands: `proxy-over-smtp server`, `proxy-over-smtp client`, `proxy-over-smtp version` (also `--version`).
 
-Audit logger: `log.Logger`, prefix `AUDIT: `, output stdout + file via `io.MultiWriter`.
+Precedence: command-line flag, then environment variable, then default. The env name is `PROXY_OVER_SMTP_` plus the flag name uppercased with `-` as `_`. `--help` shows each name.
+
+| Flag | Env | Default | Commands | Purpose |
+|---|---|---|---|---|
+| `--listen` | `PROXY_OVER_SMTP_LISTEN` | server `0.0.0.0:465`, client `0.0.0.0:1080` | server, client | Listen address |
+| `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address dialed by client |
+| `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | EHLO token and XOR key. Prefer the env var: argv is visible in `ps` |
+| `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback/private/link-local targets |
+| `--log-level` | `PROXY_OVER_SMTP_LOG_LEVEL` | `info` | all | `debug`, `info`, `warn`, `error` |
+| `--log-format` | `PROXY_OVER_SMTP_LOG_FORMAT` | `text` | all | `text` or `json` |
+| `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file. Stdout only when empty |
+
+Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`), `target unreachable` (warn), `shutdown complete`. Handshake and SOCKS rejections log at debug. The secret is never logged.
 
 ---
 
@@ -150,7 +162,7 @@ Audit logger: `log.Logger`, prefix `AUDIT: `, output stdout + file via `io.Multi
 - **Per connection:** one goroutine tracked in `Tunnel.conns`. `context.AfterFunc` closes the connection on cancel and is released when the handler returns.
 - **Per smux stream (server):** one goroutine tracked in `Tunnel.conns`: 30s deadline for SOCKS5, dial, reply, relay.
 - **Client session:** `Tunnel.sess` guarded by `sessMu`. Created lazily, re-dialed when closed. A failed stream open drops the session and retries once on a fresh one. Closed on shutdown.
-- **Shutdown:** `SIGINT`/`SIGTERM` cancels the context → listeners close, sessions close → `main` waits up to 5s on `Tunnel.Wait()` → logs `Shutdown Complete` or `Shutdown Timed-Out. Forcing Exit`.
+- **Shutdown:** `SIGINT`/`SIGTERM` cancels the context → listeners close, sessions close → the CLI waits up to 5s on `Tunnel.Wait()` → logs `shutdown complete` or `shutdown timed out, forcing exit`.
 
 ---
 
@@ -161,6 +173,8 @@ Audit logger: `log.Logger`, prefix `AUDIT: `, output stdout + file via `io.Multi
 3. **Single multiplexed session** — one TCP + handshake per client, many streams via smux. Lower latency, fewer connections.
 4. **SOCKS parsed server-side** — client stays a dumb byte pipe.
 5. **Reusable code in `pkg/`** — XOR stream, SOCKS5 and relay carry no app state. App wiring stays in `internal/`.
-6. **Stdlib first** — only third-party dependency is `xtaci/smux`.
-7. **Target ACL on by default** — the server is an outbound proxy for anyone holding the secret, so private ranges are blocked unless `-allow-private`. Uses stdlib predicates only (CGNAT `100.64.0.0/10` not covered).
-8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64).
+6. **Stdlib first** — third-party dependencies are `xtaci/smux` (multiplexer) and `spf13/cobra` (CLI). No viper: env fallback is a small pflag walker in `internal/cli/env.go`.
+7. **Target ACL on by default** — the server is an outbound proxy for anyone holding the secret, so private ranges are blocked unless `--allow-private`. Uses stdlib predicates only (CGNAT `100.64.0.0/10` not covered).
+8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64). Version, commit and date are injected via ldflags.
+9. **Twelve-factor** — config only from flags and env (no default secret), logs as a stdout event stream, stateless processes, port binding via `--listen`, graceful SIGTERM drain, `version` as an admin command.
+10. **smux v2 per-stream windows** — with v1 one unread stream fills the shared session buffer and stalls every stream. Limitation: smux has no half-close, so a client that only shuts down its write side (e.g. `nc -N`) loses the response.
