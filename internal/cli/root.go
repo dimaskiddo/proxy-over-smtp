@@ -46,12 +46,6 @@ func Execute(ctx context.Context, info BuildInfo) (restart bool, err error) {
 	return err == nil && a.restart.Load(), err
 }
 
-// newRoot builds the command tree for tests that do not need the app handle.
-func newRoot(info BuildInfo, out io.Writer) *cobra.Command {
-	root, _ := newApp(info, out)
-	return root
-}
-
 // newApp builds the command tree and returns the app that owns its shared state.
 func newApp(info BuildInfo, out io.Writer) (*cobra.Command, *app) {
 	a := &app{out: out, info: info}

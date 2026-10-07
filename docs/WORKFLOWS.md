@@ -61,7 +61,7 @@ flowchart TD
 
 ### 2. Server (`internal/tunnel/server.go`)
 
-1. Listen on `--listen` through the tuned listener (`t.listen`: buffers, reuse, keepalive, see [ARCHITECTURE.md](ARCHITECTURE.md#4a-socket-options)). `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
+1. Listen on `--listen` through the tuned listener (`t.listen`: buffers, reuse, keepalive, see [ARCHITECTURE.md](ARCHITECTURE.md#5-socket-options)). `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
 2. Per accepted connection (tracked in `conns`): 30s deadline, SMTP handshake with exact secret match (see [ARCHITECTURE.md](ARCHITECTURE.md#2-handshake-fake-smtp)).
 3. Clear the deadline, wrap in `xorstream.New(rw, secret)`, start `smux.Server`.
 4. Loop on `sess.AcceptStream()`. Once draining starts, new streams are closed at once and the session closes when its last stream ends. Per stream, in its own tracked goroutine with a 30s deadline until the reply is sent:

@@ -59,7 +59,9 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 		return
 	}
 
-	var app io.ReadWriteCloser = &bufConn{r: br, Conn: local}
+	bc := &bufConn{r: br, Conn: local}
+
+	var app io.ReadWriteCloser = bc
 
 	if first[0] == 0x16 {
 		if t.tlsCfg == nil {
@@ -67,9 +69,8 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 			return
 		}
 
-		// app is a *bufConn here, so the assertion cannot fail. The handshake runs under the
-		// deadline set above and replays the peeked ClientHello bytes.
-		tc := tls.Server(app.(net.Conn), t.tlsCfg)
+		// The handshake runs under the deadline set above and replays the peeked ClientHello bytes.
+		tc := tls.Server(bc, t.tlsCfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
 			t.log.Debug("tls handshake failed", "peer", local.RemoteAddr().String(), "err", err)
 			return

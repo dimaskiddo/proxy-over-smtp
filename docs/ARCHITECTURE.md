@@ -13,7 +13,7 @@ graph LR
     end
 
     subgraph internal["internal/"]
-        Cli["cli/<br/>root.go env.go log.go<br/>server.go client.go version.go"]
+        Cli["cli/<br/>root.go env.go log.go<br/>update.go version.go"]
         Config["config/"]
         Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go mux.go socket*.go"]
         Update["update/<br/>update.go replace.go<br/>restart_*.go"]
@@ -182,7 +182,7 @@ Because the client forwards raw bytes, adding protocols needs no wire change: ol
 
 ---
 
-## 4a. Socket options
+## 5. Socket options
 
 Implemented in `internal/tunnel/socket*.go`. Fixed in code: no flags, no env vars. They apply to all four TCP sockets: server listener, server-to-target dial, client listener and client-to-server dial. Accepted connections inherit buffer sizes from the listener. Options are set in the `Control` hook, after `socket()` and before `bind()` or `connect()`, so they take effect for window scaling. A failed `setsockopt` fails the listen or dial. The target ACL runs before them on server dials.
 
@@ -203,13 +203,13 @@ Consequences:
 
 ---
 
-## 5. Relay (`pkg/relay/relay.go`)
+## 6. Relay (`pkg/relay/relay.go`)
 
 Two `io.CopyBuffer` goroutines (one per direction) with 32KB buffers from a `sync.Pool`. The reader and writer are wrapped so `WriterTo`/`ReaderFrom` fast paths cannot bypass the pool. When the first direction ends, `Pipe` closes both ends and returns only after both copies have exited.
 
 ---
 
-## 6. Configuration & Logging (`internal/cli/`, `internal/config/config.go`)
+## 7. Configuration & Logging (`internal/cli/`, `internal/config/config.go`)
 
 Commands: `proxy-over-smtp server`, `proxy-over-smtp client`, `proxy-over-smtp update [--check] [--force]`, `proxy-over-smtp version` (also `--version`).
 
@@ -234,7 +234,7 @@ Logging: `log/slog` with structured key/value fields, written to stdout as an ev
 
 ---
 
-## 7. Concurrency & Shutdown
+## 8. Concurrency & Shutdown
 
 - **Accept loop:** shared by both modes. Accept errors retry with 5ms–1s backoff.
 - **Per connection:** one goroutine tracked in `Tunnel.conns`. `context.AfterFunc` closes the connection on cancel and is released when the handler returns.
@@ -254,7 +254,7 @@ Auto-update restart takes the same path before re-exec.
 
 ---
 
-## 7a. Self-update (`internal/update/`)
+## 9. Self-update (`internal/update/`)
 
 1. `Latest` reads the GitHub `releases/latest` JSON (`tag_name`, asset names and URLs). Hidden `--update-api` overrides the endpoint for tests and mirrors.
 2. `assetName` maps GOOS/GOARCH to the GoReleaser archive name `proxy-over-smtp_<ver>_<os>_<arch>.zip` (darwin→macos, 386→32-bit, amd64→64-bit, arm64→arm-64-bit). It is coupled to `.goreleaser.yml`: rename one, rename the other.
@@ -266,7 +266,7 @@ Auto-update restart takes the same path before re-exec.
 
 ---
 
-## 8. Key Design Decisions
+## 10. Key Design Decisions
 
 1. **Fake SMTP handshake** — first bytes look like a mail session to naive DPI.
 2. **XOR is obfuscation, not encryption** — the secret is sent in plaintext in `EHLO` and there is no TLS. Do not rely on confidentiality.
@@ -281,5 +281,5 @@ Auto-update restart takes the same path before re-exec.
 11. **Self-update from stdlib** — no update library; `net/http`, `archive/zip` and `crypto/sha256` cover it. Auto-update is opt-in because it can split server and client versions.
 12. **One HTTP request per connection** — plain HTTP forwarding sets `Connection: close` and strips hop-by-hop headers. Keep-alive across different hosts would need a request loop; modern clients use `CONNECT` for HTTPS, which is a raw relay.
 13. **Drain before close** — listeners stop first and connections finish on their own, bounded by `--drain-timeout`. A second signal forces. Container and orchestrator grace periods must exceed the drain timeout.
-14. **Socket options fixed in code** — buffers, `TCP_NODELAY`, keepalive and reuse flags are constants, not settings: one tested profile, no per-deployment tuning to get wrong. Cost: no runtime override of the 4096 buffers. See [Socket options](#4a-socket-options).
+14. **Socket options fixed in code** — buffers, `TCP_NODELAY`, keepalive and reuse flags are constants, not settings: one tested profile, no per-deployment tuning to get wrong. Cost: no runtime override of the 4096 buffers. See [Socket options](#5-socket-options).
 15. **Doc comments** — Google Go style: a package comment per package, a doc comment starting with the name on every exported and non-trivial unexported symbol, bodies comment only the why.

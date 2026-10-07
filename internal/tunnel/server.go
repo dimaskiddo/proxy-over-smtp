@@ -332,9 +332,8 @@ func replyCode(err error) byte {
 		return socks5.ConnectionRefused
 	case errors.Is(err, syscall.ENETUNREACH):
 		return socks5.NetworkUnreachable
-	case errors.As(err, &dnsErr), errors.Is(err, syscall.EHOSTUNREACH):
-		return socks5.HostUnreachable
-	case errors.As(err, &netErr) && netErr.Timeout():
+	case errors.As(err, &dnsErr), errors.Is(err, syscall.EHOSTUNREACH),
+		errors.As(err, &netErr) && netErr.Timeout():
 		return socks5.HostUnreachable
 	default:
 		return socks5.GeneralFailure

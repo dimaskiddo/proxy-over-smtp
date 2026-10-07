@@ -2,9 +2,18 @@ package cli
 
 import (
 	"bytes"
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
+
+// newRoot builds the command tree for tests that do not need the app handle.
+func newRoot(info BuildInfo, out io.Writer) *cobra.Command {
+	root, _ := newApp(info, out)
+	return root
+}
 
 // run executes the command tree with args and returns its combined stdout and stderr.
 func run(t *testing.T, args ...string) (string, error) {

@@ -2,10 +2,38 @@ package tunnel
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"syscall"
 	"time"
 )
+
+// sockOpt is one setsockopt call.
+type sockOpt struct {
+	name       string
+	level, opt int
+	val        int
+}
+
+// setInts applies each option to the socket behind c and wraps the first failure with its name.
+// The per-OS setsockopt supplies the platform call.
+func setInts(c syscall.RawConn, opts []sockOpt) error {
+	var serr error
+
+	err := c.Control(func(fd uintptr) {
+		for _, o := range opts {
+			if e := setsockopt(fd, o.level, o.opt, o.val); e != nil {
+				serr = fmt.Errorf("set %s: %w", o.name, e)
+				return
+			}
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("control socket: %w", err)
+	}
+
+	return serr
+}
 
 const (
 	// sockBuffer is the kernel send and receive buffer for every tunnel socket. It favors many

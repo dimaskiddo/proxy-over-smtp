@@ -31,7 +31,7 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 *   **🎭 SMTP Disguise:** Every connection opens with a plausible `220` / `EHLO` / `DATA` exchange before tunneling starts.
 *   **🧩 XOR Obfuscation:** Payload is XORed with a rolling key derived from your shared secret.
 *   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
-*   **🔧 Tuned Sockets:** Every socket gets fixed kernel options in code: 4096-byte send and receive buffers, `TCP_NODELAY`, TCP keepalive, and `SO_REUSEADDR` / `SO_REUSEPORT` on Unix listeners. Nothing to configure. The small buffers suit many small flows, not bulk transfer: see [Socket options](docs/ARCHITECTURE.md#4a-socket-options).
+*   **🔧 Tuned Sockets:** Every socket gets fixed kernel options in code: 4096-byte send and receive buffers, `TCP_NODELAY`, TCP keepalive, and `SO_REUSEADDR` / `SO_REUSEPORT` on Unix listeners. Nothing to configure. The small buffers suit many small flows, not bulk transfer: see [Socket options](docs/ARCHITECTURE.md#5-socket-options).
 *   **🧦 Many Proxy Protocols, One Port:** SOCKS4/4a, SOCKS5, HTTP (plain and `CONNECT`) and HTTPS (TLS proxy listener) are auto-detected from the first byte. Works with browsers, `curl`, `git`, `apt` and anything that honors `http_proxy` / `https_proxy` or SOCKS.
 *   **🛑 Graceful Shutdown:** On `SIGINT` / `SIGTERM` the listener stops and active connections drain until done or `--drain-timeout` (default 30s). A second signal forces exit.
 *   **📝 Structured Logs:** `slog` events on stdout (text or JSON), one `tunnel opened` line per proxied connection. Optional log file.
