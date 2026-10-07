@@ -35,7 +35,7 @@ const maxHeader = 64 << 10
 // It then stops accepting and returns without touching open connections: call Shutdown to
 // drain them.
 func (t *Tunnel) RunServer(ctx context.Context) error {
-	ln, err := net.Listen("tcp", t.cfg.Listen)
+	ln, err := t.listen(ctx)
 	if err != nil {
 		return fmt.Errorf("listen server: %w", err)
 	}
@@ -193,7 +193,7 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 	// The header cap guards request parsing only. It must not truncate the relayed body.
 	lr.N = math.MaxInt64
 
-	d := net.Dialer{Timeout: defaultTimeout, Control: t.dialControl}
+	d := dialer(t.dialControl)
 	dest, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
 		t.log.Warn("target unreachable", "target", target, "proto", proto, "err", err)

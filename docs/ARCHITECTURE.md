@@ -15,7 +15,7 @@ graph LR
     subgraph internal["internal/"]
         Cli["cli/<br/>root.go env.go log.go<br/>server.go client.go version.go"]
         Config["config/"]
-        Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go mux.go"]
+        Tunnel["tunnel/<br/>client.go server.go<br/>tunnel.go mux.go socket*.go"]
         Update["update/<br/>update.go replace.go<br/>restart_*.go"]
     end
 
@@ -29,6 +29,7 @@ graph LR
 
     Smux["xtaci/smux"]
     Cobra["spf13/cobra"]
+    Sys["golang.org/x/sys"]
 
     Main --> Cli
     Main --> Update
@@ -42,6 +43,7 @@ graph LR
     Tunnel --> Relay
     Tunnel --> Xor
     Tunnel --> Smux
+    Tunnel --> Sys
     Cli --> Cobra
 ```
 
@@ -77,6 +79,7 @@ sequenceDiagram
 | **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream protocol detection + negotiation + dial + relay |
 | **Update** | `internal/update/` | Release lookup, verified download, self-replace, re-exec |
 | **Mux** | `internal/tunnel/mux.go` | Shared smux config for both sides |
+| **Socket** | `internal/tunnel/socket*.go` | Tuned listener and dialer for all four TCP sockets. Per-OS option calls |
 | **SOCKS5** | `pkg/socks5/` | Server-side negotiation, returns `host:port` |
 | **SOCKS4** | `pkg/socks4/` | SOCKS4/4a request parser and reply writer, returns `host:port` |
 | **HTTP proxy** | `pkg/httpproxy/` | CONNECT and absolute-form request parser, status writer, request forwarder |
@@ -179,6 +182,27 @@ Because the client forwards raw bytes, adding protocols needs no wire change: ol
 
 ---
 
+## 4a. Socket options
+
+Implemented in `internal/tunnel/socket*.go`. Fixed in code: no flags, no env vars. They apply to all four TCP sockets: server listener, server-to-target dial, client listener and client-to-server dial. Accepted connections inherit buffer sizes from the listener. Options are set in the `Control` hook, after `socket()` and before `bind()` or `connect()`, so they take effect for window scaling. A failed `setsockopt` fails the listen or dial. The target ACL runs before them on server dials.
+
+| Option | Value | Sockets | OS |
+|---|---|---|---|
+| `SO_RCVBUF`, `SO_SNDBUF` | 4096 | all | all |
+| `TCP_NODELAY` | on | all | all |
+| TCP keepalive | idle 15s, interval 15s, 9 probes | all | all |
+| `SO_REUSEADDR` | on | listeners | Unix only |
+| `SO_REUSEPORT` | on | listeners | Unix only |
+
+Consequences:
+
+- A fixed buffer turns off kernel autotuning. All streams share one tunnel connection, so throughput is capped near buffer/RTT: about 80KB/s at 50ms RTT. Linux stores double the value (`ss` shows `rb8192`) and window scaling stays off (`wscale 0`). To change it, edit `sockBuffer` in `socket.go`.
+- `SO_REUSEPORT` lets a new binary bind the port while the old one drains (zero-downtime restart). It also means a second server accidentally started on the same port succeeds, and the kernel splits connections between both processes.
+- Windows has no `SO_REUSEPORT`, and its `SO_REUSEADDR` lets another process take a bound port, so neither is set there.
+- Keepalive also covers target sockets, which have no smux keepalive.
+
+---
+
 ## 5. Relay (`pkg/relay/relay.go`)
 
 Two `io.CopyBuffer` goroutines (one per direction) with 32KB buffers from a `sync.Pool`. The reader and writer are wrapped so `WriterTo`/`ReaderFrom` fast paths cannot bypass the pool. When the first direction ends, `Pipe` closes both ends and returns only after both copies have exited.
@@ -249,7 +273,7 @@ Auto-update restart takes the same path before re-exec.
 3. **Single multiplexed session** — one TCP + handshake per client, many streams via smux. Lower latency, fewer connections.
 4. **Protocols parsed server-side** — the client stays a dumb byte pipe, so detection on the server adds SOCKS4 and HTTP without changing the wire format. The only client-side parsing is the TLS ClientHello check, and only when a certificate is configured.
 5. **Reusable code in `pkg/`** — XOR stream, SOCKS4/5, HTTP proxy parsing and relay carry no app state. App wiring stays in `internal/`.
-6. **Stdlib first** — third-party dependencies are `xtaci/smux` (multiplexer) and `spf13/cobra` (CLI). No viper: env fallback is a small pflag walker in `internal/cli/env.go`.
+6. **Stdlib first** — third-party dependencies are `xtaci/smux` (multiplexer), `spf13/cobra` (CLI) and `golang.org/x/sys` (per-OS socket option constants, which `syscall` lacks for `SO_REUSEPORT` on Linux). No viper: env fallback is a small pflag walker in `internal/cli/env.go`.
 7. **Target ACL on by default** — the server is an outbound proxy for anyone holding the secret, so private ranges are blocked unless `--allow-private`. Uses stdlib predicates only (CGNAT `100.64.0.0/10` not covered).
 8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64). Version, commit and date are injected via ldflags.
 9. **Twelve-factor** — config only from flags and env (no default secret), logs as a stdout event stream, stateless processes, port binding via `--listen`, graceful SIGTERM drain, `version` as an admin command.
@@ -257,4 +281,5 @@ Auto-update restart takes the same path before re-exec.
 11. **Self-update from stdlib** — no update library; `net/http`, `archive/zip` and `crypto/sha256` cover it. Auto-update is opt-in because it can split server and client versions.
 12. **One HTTP request per connection** — plain HTTP forwarding sets `Connection: close` and strips hop-by-hop headers. Keep-alive across different hosts would need a request loop; modern clients use `CONNECT` for HTTPS, which is a raw relay.
 13. **Drain before close** — listeners stop first and connections finish on their own, bounded by `--drain-timeout`. A second signal forces. Container and orchestrator grace periods must exceed the drain timeout.
-14. **Doc comments** — Google Go style: a package comment per package, a doc comment starting with the name on every exported and non-trivial unexported symbol, bodies comment only the why.
+14. **Socket options fixed in code** — buffers, `TCP_NODELAY`, keepalive and reuse flags are constants, not settings: one tested profile, no per-deployment tuning to get wrong. Cost: no runtime override of the 4096 buffers. See [Socket options](#4a-socket-options).
+15. **Doc comments** — Google Go style: a package comment per package, a doc comment starting with the name on every exported and non-trivial unexported symbol, bodies comment only the why.

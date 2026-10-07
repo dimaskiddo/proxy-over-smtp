@@ -61,7 +61,7 @@ flowchart TD
 
 ### 2. Server (`internal/tunnel/server.go`)
 
-1. Listen on `--listen`. `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
+1. Listen on `--listen` through the tuned listener (`t.listen`: buffers, reuse, keepalive, see [ARCHITECTURE.md](ARCHITECTURE.md#4a-socket-options)). `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
 2. Per accepted connection (tracked in `conns`): 30s deadline, SMTP handshake with exact secret match (see [ARCHITECTURE.md](ARCHITECTURE.md#2-handshake-fake-smtp)).
 3. Clear the deadline, wrap in `xorstream.New(rw, secret)`, start `smux.Server`.
 4. Loop on `sess.AcceptStream()`. Once draining starts, new streams are closed at once and the session closes when its last stream ends. Per stream, in its own tracked goroutine with a 30s deadline until the reply is sent:
@@ -75,7 +75,7 @@ sequenceDiagram
     C->>S: first bytes
     Note over S: 0x05 SOCKS5, 0x04 SOCKS4/4a, A-Z HTTP, else close
     C->>S: request (SOCKS greeting + request, or HTTP request line + headers)
-    S->>T: dial (30s, ACL after DNS)
+    S->>T: dial (30s, ACL after DNS, then socket options)
     S->>C: SOCKS reply, or 200 for CONNECT, or error status
     Note over S: log: tunnel opened peer, target, proto
     C-->>T: relay.Pipe both ways
@@ -85,9 +85,9 @@ For plain HTTP (absolute-form) there is no `200`: the server rewrites the reques
 
 ### 3. Client (`internal/tunnel/client.go`)
 
-1. Listen on `--listen`. `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
+1. Listen on `--listen` through the same tuned listener. `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
 2. Per accepted local connection (tracked in `conns`): 30s deadline, peek the first byte. If it is `0x16` and `--tls-cert`/`--tls-key` are set, terminate TLS (handshake bound by the same deadline). If it is `0x16` without a certificate, close with debug log `tls not enabled`. Then `getSession`.
-3. `getSession` under `sessMu`: reuse `Tunnel.sess` if open. Otherwise dial `--remote` (30s, cancelled by shutdown), run the client handshake, wrap in XOR, `smux.Client`.
+3. `getSession` under `sessMu`: reuse `Tunnel.sess` if open. Otherwise dial `--remote` (30s, tuned dialer, cancelled by shutdown), run the client handshake, wrap in XOR, `smux.Client`.
 4. Open a stream (on failure drop the session and retry once on a fresh one) and `relay.Pipe(local, stream)`. The application's proxy bytes (decrypted when TLS was terminated) travel unchanged to the server.
 
 ### 4. Update (`internal/update/`, `internal/cli/update.go`)
@@ -163,7 +163,8 @@ Auto-update runs the same drain before it re-executes.
 | Target blocked by ACL | Warn `target unreachable` with `target`, `err`. SOCKS5 `0x02`, SOCKS4 `0x5B`, HTTP `403` |
 | Target dial fails | Warn `target unreachable` with `target`, `err`. SOCKS5 `0x05` refused / `0x03` network / `0x04` host / `0x01` other. SOCKS4 `0x5B`. HTTP `504` on timeout, else `502` |
 | Accept fails | Warn `accept failed`, retry with backoff up to 1s |
-| Listen fails | Cobra prints the error, exit 1 |
+| Listen fails, including a failed `setsockopt` on the listener | Cobra prints the error, exit 1 |
+| `setsockopt` fails on a dial | Dial fails like any dial error: client `open stream failed`, server `target unreachable` |
 | `--log-file` cannot be opened | Exit 1 |
 | Secret missing, bad env value (e.g. `PROXY_OVER_SMTP_ALLOW_PRIVATE=x`), bad `--log-level` / `--log-format` | Exit 1 at startup |
 | Old-style flag (`-secret`, `-mode`) | Exit 1, unknown shorthand flag |

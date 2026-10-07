@@ -20,7 +20,7 @@ import (
 // shared tunnel session until ctx is done. It then stops accepting and returns: open
 // transfers keep running until Shutdown drains them and closes the session.
 func (t *Tunnel) RunClient(ctx context.Context) error {
-	ln, err := net.Listen("tcp", t.cfg.Listen)
+	ln, err := t.listen(ctx)
 	if err != nil {
 		return fmt.Errorf("listen client: %w", err)
 	}
@@ -125,7 +125,7 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 		return t.sess, nil
 	}
 
-	d := net.Dialer{Timeout: defaultTimeout}
+	d := dialer(nil)
 	remote, err := d.DialContext(ctx, "tcp", t.cfg.Remote)
 	if err != nil {
 		return nil, fmt.Errorf("dial server: %w", err)

@@ -27,7 +27,7 @@ SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with XOR-ob
 | **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `assetName` mirrors `.goreleaser.yml` archive names |
-| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial. `Shutdown(ctx)` drains. `mux.go`: smux config |
+| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial. `Shutdown(ctx)` drains. `mux.go`: smux config. `socket*.go`: fixed socket options (buffers, reuse, keepalive), per-OS |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
 | **SOCKS4** | `pkg/socks4/` — SOCKS4/4a request parser and reply writer (CONNECT only) |
 | **HTTP proxy** | `pkg/httpproxy/` — CONNECT and absolute-form parser, status writer, forwarder |
