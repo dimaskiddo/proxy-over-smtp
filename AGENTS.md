@@ -26,7 +26,7 @@ SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with a sele
 | Component | Role |
 |---|---|
 | **Entry** | `cmd/proxy-over-smtp/` — wiring only: signal context, ldflags build info, `cli.Execute` |
-| **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `slog` logger, graceful drain |
+| **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `mode.go` mode-from-env arg injection, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `ShouldUpdate` adds tag-to-commit resolution (best effort) on top of `Newer`. `assetName` mirrors `.goreleaser.yml` archive names |
 | **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, session pool (`--pool-min`/`--pool-max`), SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial, per-session stream cap (`--max-streams`, default 128). Handshake lines capped at 4KB. `Shutdown(ctx)` drains; `spawn` and `Shutdown` share a lock so no handler starts mid-drain, and `RunServer`/`RunClient` after `Shutdown` return an error. `handshake.go`: challenge-response + key derivation + capped line reads. `cipher.go`: XOR/AES stream selection. `mux.go`: smux config. `pool.go`: client session pool (client-only). `socket*.go`: fixed socket options (TCP_NODELAY, reuse, keepalive; send/receive buffers left to kernel autotuning), per-OS |
@@ -46,6 +46,8 @@ proxy-over-smtp [--log-level info] [--log-format text] [--log-file ""] <command>
   update   [--check] [--force]
   version  (also --version)
 ```
+
+`PROXY_OVER_SMTP_MODE` is not a flag: with no subcommand on the command line, `server` or `client` is inserted as one. An explicit subcommand wins, `update`/`version` are never selected this way, and any other value exits 1. It is resolved in `internal/cli/mode.go` before `ExecuteContext`, not in `applyEnv`, which runs after cobra has dispatched.
 
 Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_` (e.g. `PROXY_OVER_SMTP_SECRET`), including the hidden `--update-api`. Precedence: flag > env > default. The secret has no default. `--cipher` is `xor` or `aes` (default) and must match on both ends. `--listen` and `--remote` are validated as `host:port` at startup. `--pool-min`/`--pool-max` are client-only and must satisfy `1 <= min <= max <= 16`.
 

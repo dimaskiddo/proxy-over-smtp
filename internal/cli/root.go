@@ -40,6 +40,15 @@ type app struct {
 // auto-update installed a new binary and the caller should re-exec it.
 func Execute(ctx context.Context, info BuildInfo) (restart bool, err error) {
 	root, a := newApp(info, os.Stdout)
+
+	args, err := resolveModeArg(root.PersistentFlags(), os.Args[1:])
+	if err != nil {
+		// Cobra never runs, so it cannot print this one itself.
+		root.PrintErrln(root.ErrPrefix(), err.Error())
+		return false, err
+	}
+
+	root.SetArgs(args)
 	err = root.ExecuteContext(ctx)
 
 	// A failed run must not re-exec, even if an update was installed earlier.
@@ -51,8 +60,11 @@ func newApp(info BuildInfo, out io.Writer) (*cobra.Command, *app) {
 	a := &app{out: out, info: info}
 
 	root := &cobra.Command{
-		Use:           "proxy-over-smtp",
-		Short:         "SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session",
+		Use:   "proxy-over-smtp",
+		Short: "SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session",
+		Long: "SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session.\n\n" +
+			"With no subcommand, $PROXY_OVER_SMTP_MODE selects the mode: server or client. An explicit\n" +
+			"subcommand always wins.",
 		Version:       info.String(),
 		SilenceUsage:  true,
 		SilenceErrors: false,

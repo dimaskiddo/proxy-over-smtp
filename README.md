@@ -91,7 +91,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/WORKFLOWS.md](docs/WO
 4.  Point your browser or tool at `127.0.0.1:1080` (or your client port) as a SOCKS or HTTP proxy. See [Using the proxy](#using-the-proxy).
 5.  Docker sends `SIGKILL` after 10s by default, which cuts the drain. Give it more time than `--drain-timeout`: `docker run --stop-timeout 35 ...`, or `stop_grace_period: 35s` in Compose. In Kubernetes set `terminationGracePeriodSeconds` above the drain timeout.
 
-The image entrypoint is `proxy-over-smtp` and the default command is `server`.
+The image entrypoint is `proxy-over-smtp` and the default command is `server`. That default is an explicit subcommand, so it always wins over `PROXY_OVER_SMTP_MODE`; the variable is for runs whose command line carries no subcommand at all.
 
 ### 📦 **Using Pre-Built Binaries**
 
@@ -153,10 +153,22 @@ proxy-over-smtp <command> [flags]
 Proxy-Over-SMTP v0.5.0~c04bfca
 ```
 
+With no subcommand, `PROXY_OVER_SMTP_MODE` picks the mode instead — useful where the command line is fixed, such as a systemd unit, a container or a Compose service:
+
+```ini
+# systemd unit
+Environment=PROXY_OVER_SMTP_MODE=server
+Environment=PROXY_OVER_SMTP_SECRET=change-me
+ExecStart=/usr/local/bin/proxy-over-smtp
+```
+
+It accepts `server` or `client` only, and an explicit subcommand always wins. `update` and `version` are never selected this way, so a stray environment variable cannot self-replace the binary.
+
 Server and client use the same binary and the same secret. Every flag can also be set through an environment variable named `PROXY_OVER_SMTP_` plus the flag name in upper case with `-` as `_`. Precedence: flag, then env, then default.
 
 | Flag | Env | Default | Commands | Purpose |
 |---|---|---|---|---|
+| — | `PROXY_OVER_SMTP_MODE` | empty | server, client | Mode to run when no subcommand is given: `server` or `client`. An explicit subcommand wins |
 | `--listen` | `PROXY_OVER_SMTP_LISTEN` | server `0.0.0.0:465`, client `0.0.0.0:1080` | server, client | Listen address |
 | `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address the client dials |
 | `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Shared secret: handshake authentication and stream key master. Prefer the env var |
@@ -266,52 +278,13 @@ The first two lines are the server; the third is the client. `tunnel opened` and
 
 ## 📈 Performance
 
-The tunnel is built to hold **80% of line rate up to 1 Gbps**, with one caveat that follows from how TCP multiplexing works: **one stream cannot fill a high-latency link**. Each smux stream carries a fixed 512KB window, so a single stream tops out near `window / RTT`. A WAN link needs **several concurrent connections** (browsers already open many) to reach line rate.
+The tunnel holds **80% of line rate up to 1 Gbps**, measured over **multiple concurrent streams**. One stream cannot fill a high-latency link: each smux stream carries a fixed 512KB window, so a single stream tops out near `window / RTT` — about 205 Mbps at 20 ms RTT and 82 Mbps at 50 ms. Browsers and download managers already open many connections.
 
-Per-stream ceiling at the fixed 512KB window (`window / RTT`):
+A session aggregates its streams up to a 16MB receive buffer, and `--pool-min`/`--pool-max` add sessions, each with its own buffer, so the client's aggregate bound is `pool × 16MB / RTT`. Rule of thumb: sessions ≈ target Gbps ÷ 1.3, capped at 16. One flow never crosses a session, so a single TCP connection is always capped by `window / RTT` no matter how large the pool.
 
-| RTT | One stream | Streams for 800 Mbps (100 MB/s) |
-|---|---|---|
-| 1 ms (LAN) | ~4 Gbps | 1 |
-| 20 ms | ~205 Mbps | 4 |
-| 50 ms | ~82 Mbps | 10 |
-| 100 ms | ~41 Mbps | 20 |
+Measured on one host: ~1.1 Gbps per stream (`aes`), ~1.3 Gbps aggregate for a single session, and ~190 MB/s (`xor`) across two pooled sessions.
 
-All counts sit well under the `--max-streams` default of 128, and the session-wide 16MB receive buffer clears 800 Mbps up to ~100 ms RTT once the streams are open.
-
-Measured on a Ryzen 5 PRO 4650U, 200MB transfer through the client on one host:
-
-| Path | Throughput |
-|---|---|
-| Tunnel, `--cipher aes`, 1 stream | ~139 MB/s (~1.1 Gbps) |
-| Tunnel, `--cipher xor`, 1 stream | ~133 MB/s |
-| Tunnel ceiling, single session (aggregate) | ~161 MB/s (~1.3 Gbps) |
-| 8 streams on one session, `aes` / `xor` | ~80 MB/s / ~125 MB/s |
-| 8 streams over two pooled sessions, `aes` / `xor` | ~130 MB/s / ~190 MB/s |
-
-Both ciphers land in the same place end to end: AES has hardware GCM, and XOR's read path is zero-copy, so the cost is dominated by syscalls and scheduling rather than crypto. `--cipher aes` stays the default.
-
-The last two rows are from `make bench` on loopback, where RTT is near zero. Spreading eight streams over two sessions beats putting all eight on one by 1.5x to 2x in a given run, because the ceiling there is one core's syscall and scheduling cost rather than a window: the pool buys CPU parallelism on one host, and window/RTT on a real link. The absolute rates swing run to run on a shared machine, so compare rows within one run, not across runs. Either way, one session's ceiling is not a wall for a whole client.
-
-Aggregate through the proxy on the same host, each transfer capped so the cap - not the link - sets the demand:
-
-| Demand | Sessions used | Aggregate |
-|---|---|---|
-| 1 transfer, `--limit-rate 100M` | 1 | 105 MB/s (`aes` 99% of direct, `xor` 100%) |
-| 4 transfers, `--limit-rate 100M` (400M) | 1 | 172 MB/s |
-| 20 transfers, `--limit-rate 25M` (500M) | 2 | 190 MB/s |
-| 40 transfers, `--limit-rate 15M` (600M) | 3 | 209 MB/s |
-
-The first row is a single flow and the pool cannot help it: it is one stream on one session. The rows after it pass the ~161 MB/s single-session ceiling and keep climbing as sessions are added, which is what the pool is for. They flatten quickly on this host because 40 curl processes, the origin server and both tunnel ends all share six cores; the per-session win is cleaner in `make bench`. The pool only opened those extra sessions because 16 or more streams were in flight at once: with `--max-streams 128` a slot is not considered loaded until it carries 16, so four parallel transfers stay on one session by design.
-
-**Checking it yourself.** `curl` can cap a transfer, so the cap, not the proxy, sets the target. Direct and proxied runs at the same cap should agree:
-
-```sh
-curl -o /dev/null --limit-rate 100M http://host/file                          # direct
-curl -o /dev/null --limit-rate 100M -x socks5h://127.0.0.1:1080 http://host/file
-```
-
-For aggregate, run several capped transfers at once with `&` and add the reported rates, or use `iperf3 -P 8`. Watch the session count at `--log-level debug` (`session pool shrunk`) or from the server's connection count. `make bench` prints the per-layer numbers above.
+Every number, table and caveat: [Architecture → Throughput](docs/ARCHITECTURE.md#throughput). To reproduce them by hand: [Workflows → Verifying Throughput](docs/WORKFLOWS.md#verifying-throughput).
 
 ---
 
@@ -353,7 +326,10 @@ See also the list of [contributors](https://github.com/dimaskiddo/proxy-over-smt
 
 ## ⚠️ Disclaimer
 
-**DO WITH YOUR OWN RISK (DWYR)**. This software is provided "as is", without warranty of any kind, express or implied. The authors are not responsible for any damage caused by the use of this application.
+**DO WITH YOUR OWN RISK (DWYOR)**. This software is provided "as is", without warranty of
+any kind, express or implied. Use of this software may involve risks, including but not
+limited to service disruption or data loss. The authors are not responsible for any damage
+caused by the use of this application.
 
 ---
 

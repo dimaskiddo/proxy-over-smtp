@@ -9,7 +9,10 @@ Step-by-step data flow: startup → handshake → tunnel → shutdown.
 ```mermaid
 flowchart TD
     Start([proxy-over-smtp]) --> Ctx[signal context]
-    Ctx --> Cobra[cobra: parse subcommand + flags]
+    Ctx --> Mode{no subcommand<br/>and PROXY_OVER_SMTP_MODE set?}
+    Mode -- yes --> Inject[inject mode as the subcommand]
+    Mode -- no --> Cobra
+    Inject --> Cobra[cobra: parse subcommand + flags]
     Cobra --> Env[fill unset flags from env]
     Env --> Log[build slog logger]
     Log --> Val[validate config]
@@ -57,11 +60,12 @@ flowchart TD
 ### 1. Startup (`cmd/proxy-over-smtp/main.go`)
 
 1. `signal.NotifyContext` for `SIGINT` / `SIGTERM`, then `cli.Execute(ctx, BuildInfo)`.
-2. Cobra parses the subcommand (`server`, `client`, `version`, `update`) and flags.
-3. `PersistentPreRunE`: flags not set on the command line are filled from `PROXY_OVER_SMTP_*` env (flag > env > default). Then build the `slog` logger (`--log-level`, `--log-format`, optional `--log-file` tee).
-4. `RunE`: `Config.Validate()` (secret required, one of the two ciphers, `--max-streams` above zero, `--listen` and `--remote` in `host:port` shape, TLS cert and key together, non-negative `--drain-timeout`), `tunnel.New(cfg, logger)` (loads the TLS key pair, can fail), then `RunServer(ctx)` or `RunClient(ctx)`.
-5. After the accept loop returns: drain (stage 5), then `PersistentPostRunE` closes the log file. Any error exits with code 1.
-6. If auto-update installed a release, `Execute` returns `restart=true`. `main` then calls `update.Restart()`.
+2. Mode resolution runs before cobra: when the command line names no subcommand and `PROXY_OVER_SMTP_MODE` is set to `server` or `client`, that mode is inserted as the subcommand. A subcommand the user typed always wins, `--help` / `--version` / `help` are left alone, and any other value exits 1.
+3. Cobra parses the subcommand (`server`, `client`, `version`, `update`) and flags.
+4. `PersistentPreRunE`: flags not set on the command line are filled from `PROXY_OVER_SMTP_*` env (flag > env > default). Then build the `slog` logger (`--log-level`, `--log-format`, optional `--log-file` tee).
+5. `RunE`: `Config.Validate()` (secret required, one of the two ciphers, `--max-streams` above zero, `--listen` and `--remote` in `host:port` shape, TLS cert and key together, non-negative `--drain-timeout`), `tunnel.New(cfg, logger)` (loads the TLS key pair, can fail), then `RunServer(ctx)` or `RunClient(ctx)`.
+6. After the accept loop returns: drain (stage 5), then `PersistentPostRunE` closes the log file. Any error exits with code 1.
+7. If auto-update installed a release, `Execute` returns `restart=true`. `main` then calls `update.Restart()`.
 
 ### 2. Server (`internal/tunnel/server.go`)
 

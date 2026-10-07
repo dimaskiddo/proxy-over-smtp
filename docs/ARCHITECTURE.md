@@ -181,6 +181,29 @@ What is left after the window is CPU: measured same-host at ~139 MB/s for AES an
 
 The socket buffers stay under kernel autotuning for the same reason: a fixed buffer would cap a single flow no matter how many streams are open. See [Socket options](#5-socket-options). `make bench` reports the per-layer numbers above; the guarantee is documented, not enforced by a CI gate, because shared runners are too noisy to assert throughput on.
 
+Measured on a Ryzen 5 PRO 4650U, 200MB transfer through the client on one host:
+
+| Path | Throughput |
+|---|---|
+| Tunnel, `--cipher aes`, 1 stream | ~139 MB/s (~1.1 Gbps) |
+| Tunnel, `--cipher xor`, 1 stream | ~133 MB/s |
+| Tunnel ceiling, single session (aggregate) | ~161 MB/s (~1.3 Gbps) |
+| 8 streams on one session, `aes` / `xor` | ~80 MB/s / ~125 MB/s |
+| 8 streams over two pooled sessions, `aes` / `xor` | ~130 MB/s / ~190 MB/s |
+
+The last two rows are from `make bench` on loopback, where RTT is near zero. Spreading eight streams over two sessions beats putting all eight on one by 1.5x to 2x in a given run, because the ceiling there is one core's syscall and scheduling cost rather than a window: the pool buys CPU parallelism on one host, and `window / RTT` on a real link. Absolute rates swing run to run on a shared machine, so compare rows within one run, not across runs. Either way, one session's ceiling is not a wall for a whole client.
+
+Aggregate through the proxy on the same host, each transfer capped so the cap — not the link — sets the demand:
+
+| Demand | Sessions used | Aggregate |
+|---|---|---|
+| 1 transfer, `--limit-rate 100M` | 1 | 105 MB/s (`aes` 99% of direct, `xor` 100%) |
+| 4 transfers, `--limit-rate 100M` (400M) | 1 | 172 MB/s |
+| 20 transfers, `--limit-rate 25M` (500M) | 2 | 190 MB/s |
+| 40 transfers, `--limit-rate 15M` (600M) | 3 | 209 MB/s |
+
+The first row is a single flow and the pool cannot help it: it is one stream on one session. The rows after it pass the ~161 MB/s single-session ceiling and keep climbing as sessions are added, which is what the pool is for. They flatten quickly on this host because 40 curl processes, the origin server and both tunnel ends all share six cores; the per-session win is cleaner in `make bench`. The pool opened those extra sessions only because 16 or more streams were in flight at once: with `--max-streams 128` a slot is not considered loaded until it carries 16, so four parallel transfers stay on one session by design.
+
 ---
 
 ## 4. Proxy Protocols
@@ -268,6 +291,8 @@ Two `io.CopyBuffer` goroutines (one per direction) with 128KB buffers from a `sy
 Commands: `proxy-over-smtp server`, `proxy-over-smtp client`, `proxy-over-smtp update [--check] [--force]`, `proxy-over-smtp version` (also `--version`).
 
 Precedence: command-line flag, then environment variable, then default. The env name is `PROXY_OVER_SMTP_` plus the flag name uppercased with `-` as `_`. `--help` shows each name.
+
+`PROXY_OVER_SMTP_MODE` is the one setting that is not a flag, because it chooses which command runs rather than how one behaves. It is resolved in `Execute` before `root.ExecuteContext`, by arg injection: with no positional argument on the command line, `server` or `client` is inserted as the subcommand. An explicit subcommand therefore always wins, and `update` / `version` are never selected this way. It cannot go through `applyEnv`, which runs from `PersistentPreRunE` after cobra has already dispatched. `--help`, `--version` and the `help` topic are left untouched so they still reach the root command. An invalid value exits 1 rather than falling back to help.
 
 | Flag | Env | Default | Commands | Purpose |
 |---|---|---|---|---|
