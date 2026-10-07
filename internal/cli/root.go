@@ -1,3 +1,5 @@
+// Package cli defines the command tree: server, client, update and version. It maps flags and
+// environment variables to configuration, builds the logger and drives graceful shutdown.
 package cli
 
 import (
@@ -6,7 +8,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -15,14 +19,18 @@ import (
 	"github.com/dimaskiddo/proxy-over-smtp/internal/tunnel"
 )
 
-const drainTimeout = 5 * time.Second
+// defaultDrain is how long a stopping server or client waits for open connections.
+const defaultDrain = 30 * time.Second
 
+// app carries state shared by all commands: the logger, build info and the drain and restart
+// settings. The logger exists only after PersistentPreRunE has run.
 type app struct {
 	out     io.Writer
 	log     *slog.Logger
 	closer  io.Closer
 	info    BuildInfo
 	restart atomic.Bool
+	drain   time.Duration
 
 	logLevel, logFormat, logFile string
 }
@@ -36,17 +44,19 @@ func Execute(ctx context.Context, info BuildInfo) (restart bool, err error) {
 	return err == nil && a.restart.Load(), err
 }
 
+// newRoot builds the command tree for tests that do not need the app handle.
 func newRoot(info BuildInfo, out io.Writer) *cobra.Command {
 	root, _ := newApp(info, out)
 	return root
 }
 
+// newApp builds the command tree and returns the app that owns its shared state.
 func newApp(info BuildInfo, out io.Writer) (*cobra.Command, *app) {
 	a := &app{out: out, info: info}
 
 	root := &cobra.Command{
 		Use:           "proxy-over-smtp",
-		Short:         "SOCKS5 proxy tunneled through a fake SMTP session",
+		Short:         "SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session",
 		Version:       info.String(),
 		SilenceUsage:  true,
 		SilenceErrors: false,
@@ -82,6 +92,7 @@ func newApp(info BuildInfo, out io.Writer) (*cobra.Command, *app) {
 	return root, a
 }
 
+// newVersion returns the version command, which prints build info and the author.
 func newVersion(info BuildInfo) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
@@ -93,6 +104,7 @@ func newVersion(info BuildInfo) *cobra.Command {
 	}
 }
 
+// newServer returns the server command. It validates flags before binding any port.
 func newServer(a *app) *cobra.Command {
 	var (
 		cfg config.Config
@@ -112,7 +124,15 @@ func newServer(a *app) *cobra.Command {
 				return err
 			}
 
-			t := tunnel.New(cfg, a.log)
+			if err := a.validateDrain(); err != nil {
+				return err
+			}
+
+			t, err := tunnel.New(cfg, a.log)
+			if err != nil {
+				return err
+			}
+
 			return a.run(cmd.Context(), t, upd, t.RunServer)
 		},
 	}
@@ -121,11 +141,14 @@ func newServer(a *app) *cobra.Command {
 	f.StringVar(&cfg.Listen, "listen", "0.0.0.0:465", "Server listen address")
 	f.StringVar(&cfg.Secret, "secret", "", "Shared secret: EHLO token and XOR key (prefer the env var)")
 	f.BoolVar(&cfg.AllowPrivate, "allow-private", false, "Allow loopback, private and link-local targets")
+	f.DurationVar(&a.drain, "drain-timeout", defaultDrain, "How long to wait for open connections on shutdown")
 	upd.bind(cmd)
 
 	return cmd
 }
 
+// newClient returns the client command. It validates flags and loads the optional TLS key
+// pair before binding any port.
 func newClient(a *app) *cobra.Command {
 	var (
 		cfg config.Config
@@ -134,7 +157,7 @@ func newClient(a *app) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "client",
-		Short: "Run the local SOCKS5 client",
+		Short: "Run the local proxy client (SOCKS4/5, HTTP, HTTPS)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := cfg.Validate(); err != nil {
@@ -149,40 +172,62 @@ func newClient(a *app) *cobra.Command {
 				return err
 			}
 
-			t := tunnel.New(cfg, a.log)
+			if err := a.validateDrain(); err != nil {
+				return err
+			}
+
+			t, err := tunnel.New(cfg, a.log)
+			if err != nil {
+				return err
+			}
+
 			return a.run(cmd.Context(), t, upd, t.RunClient)
 		},
 	}
 
 	f := cmd.Flags()
-	f.StringVar(&cfg.Listen, "listen", "0.0.0.0:1080", "Client SOCKS5 listen address")
+	f.StringVar(&cfg.Listen, "listen", "0.0.0.0:1080", "Client proxy listen address (SOCKS4/5, HTTP, TLS)")
 	f.StringVar(&cfg.Remote, "remote", "127.0.0.1:465", "Server address the client dials")
 	f.StringVar(&cfg.Secret, "secret", "", "Shared secret: EHLO token and XOR key (prefer the env var)")
+	f.StringVar(&cfg.TLSCert, "tls-cert", "", "PEM certificate to also accept TLS proxy connections (needs --tls-key)")
+	f.StringVar(&cfg.TLSKey, "tls-key", "", "PEM private key for --tls-cert")
+	f.DurationVar(&a.drain, "drain-timeout", defaultDrain, "How long to wait for open connections on shutdown")
 	upd.bind(cmd)
 
 	return cmd
 }
 
-// run blocks in fn until ctx is cancelled, then waits for active connections up to drainTimeout.
+// validateDrain rejects a negative --drain-timeout. Zero means close connections at once.
+func (a *app) validateDrain() error {
+	if a.drain < 0 {
+		return fmt.Errorf("drain-timeout must not be negative, got %s", a.drain)
+	}
+
+	return nil
+}
+
+// run starts fn and blocks until ctx is cancelled by a signal or an auto-update, which stops
+// new connections. It then gives open connections a.drain to finish before closing them.
+// A second SIGINT or SIGTERM during the drain closes them immediately.
 func (a *app) run(ctx context.Context, t *tunnel.Tunnel, upd updateOpts, fn func(context.Context) error) error {
 	if err := a.runWithUpdate(ctx, upd, fn); err != nil {
 		return err
 	}
 
-	a.log.Info("shutting down")
+	a.log.Info("draining", "active", t.Active(), "timeout", a.drain.String())
 
-	done := make(chan struct{})
-	go func() {
-		t.Wait()
-		close(done)
-	}()
+	dctx, cancel := context.WithTimeout(context.Background(), a.drain)
+	defer cancel()
 
-	select {
-	case <-done:
-		a.log.Info("shutdown complete")
-	case <-time.After(drainTimeout):
-		a.log.Warn("shutdown timed out, forcing exit")
+	dctx, stop := signal.NotifyContext(dctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if err := t.Shutdown(dctx); err != nil {
+		a.log.Warn("drain interrupted, connections closed", "active", t.Active(), "reason", err.Error())
+		return nil
 	}
+
+	a.log.Info("shutdown complete")
 
 	return nil
 }

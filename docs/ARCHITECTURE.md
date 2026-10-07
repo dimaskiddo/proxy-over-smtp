@@ -1,6 +1,6 @@
 # Proxy-Over-SMTP — Architecture
 
-SOCKS5 proxy in Go. A client accepts local SOCKS5 connections and forwards raw bytes through one multiplexed tunnel to a server. The tunnel opens with a fake SMTP handshake, then runs XOR-obfuscated smux. The server speaks SOCKS5 per stream and dials the target. **Config defaults:** see `internal/config/config.go` — never guess values.
+Multi-protocol proxy in Go (SOCKS4/4a, SOCKS5, HTTP, HTTPS). A client accepts local proxy connections and forwards raw bytes through one multiplexed tunnel to a server. The tunnel opens with a fake SMTP handshake, then runs XOR-obfuscated smux. The server detects the proxy protocol per stream, negotiates it and dials the target. **Config defaults:** see `internal/config/config.go` — never guess values.
 
 ---
 
@@ -21,6 +21,8 @@ graph LR
 
     subgraph pkg["pkg/"]
         Socks5["socks5/"]
+        Socks4["socks4/"]
+        HTTPProxy["httpproxy/"]
         Relay["relay/"]
         Xor["xorstream/"]
     end
@@ -35,6 +37,8 @@ graph LR
     Cli --> Tunnel
     Tunnel --> Config
     Tunnel --> Socks5
+    Tunnel --> Socks4
+    Tunnel --> HTTPProxy
     Tunnel --> Relay
     Tunnel --> Xor
     Tunnel --> Smux
@@ -52,15 +56,15 @@ sequenceDiagram
     participant S as Server
     participant T as Target
 
-    App->>C: TCP connect (:1080)
+    App->>C: TCP connect (:1080), optional TLS
     C->>S: dial (once, reused) + SMTP handshake
     C->>S: smux stream open
-    App->>C: SOCKS5 bytes
+    App->>C: proxy bytes (SOCKS4/5 or HTTP)
     C->>S: raw bytes via stream
-    S->>S: SOCKS5 negotiation
+    S->>S: detect protocol, negotiate
     S->>T: dial target
-    S->>C: SOCKS5 reply (success or error code)
-    C->>App: SOCKS5 reply
+    S->>C: protocol reply (success or error)
+    C->>App: protocol reply
     App-->>T: data (relay both ways)
 ```
 
@@ -68,12 +72,14 @@ sequenceDiagram
 |---|---|---|
 | **Entry** | `cmd/proxy-over-smtp/` | Signal context, build info (ldflags), call `cli.Execute` |
 | **CLI** | `internal/cli/` | Cobra commands (`server`, `client`, `version`, `update`), env-to-flag fallback, `slog` logger, graceful drain |
-| **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, connection `WaitGroup`, shared client session |
-| **Client** | `internal/tunnel/client.go` | Local listener. Does **not** parse SOCKS: pipes raw local bytes into a new smux stream. Browser SOCKS5 handshake is therefore answered by the server |
-| **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream SOCKS5 + dial + relay |
+| **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, TLS config, connection `WaitGroup`, active counter, hard-stop context, shared client session. `Shutdown` drains |
+| **Client** | `internal/tunnel/client.go` | Local listener. Does **not** parse proxy protocols: pipes raw local bytes into a new smux stream, so the server answers the handshake. Only exception: terminates TLS when `--tls-cert`/`--tls-key` are set and the first byte is a TLS ClientHello |
+| **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream protocol detection + negotiation + dial + relay |
 | **Update** | `internal/update/` | Release lookup, verified download, self-replace, re-exec |
 | **Mux** | `internal/tunnel/mux.go` | Shared smux config for both sides |
 | **SOCKS5** | `pkg/socks5/` | Server-side negotiation, returns `host:port` |
+| **SOCKS4** | `pkg/socks4/` | SOCKS4/4a request parser and reply writer, returns `host:port` |
+| **HTTP proxy** | `pkg/httpproxy/` | CONNECT and absolute-form request parser, status writer, request forwarder |
 | **Relay** | `pkg/relay/` | Bidirectional copy |
 | **XOR Stream** | `pkg/xorstream/` | XOR wrapper over `io.ReadWriter` |
 
@@ -102,7 +108,7 @@ TCP
  └─ fake SMTP handshake (plain text, once per connection)
      └─ XOR stream (key = secret)
          └─ smux session (one per client, many streams)
-             └─ per stream: SOCKS5 negotiation, then relay to target
+             └─ per stream: protocol detect + negotiation, then relay to target
 ```
 
 **XOR stream** (`pkg/xorstream`): separate rolling offsets for read and write, each advanced by bytes processed, wrapped at key length. Separate read and write mutexes. Both ends must use the same secret.
@@ -121,7 +127,26 @@ TCP
 
 ---
 
-## 4. SOCKS5 (`pkg/socks5/socks5.go`)
+## 4. Proxy Protocols
+
+### Detection (server, per smux stream)
+
+`handleStream` wraps the stream in a 64KB `LimitedReader` (caps header memory, raised to unlimited once the request is parsed) and a `bufio.Reader`, then peeks one byte under the 30s deadline.
+
+| First byte | Protocol | Parser |
+|---|---|---|
+| `0x05` | SOCKS5 | `pkg/socks5` |
+| `0x04` | SOCKS4 / 4a | `pkg/socks4` |
+| `A`-`Z` | HTTP (CONNECT or absolute-form) | `pkg/httpproxy` |
+| other | rejected, stream closed, debug log `proxy request rejected` | none |
+
+Because the client forwards raw bytes, adding protocols needs no wire change: old clients work with new servers.
+
+### TLS listener (client)
+
+`handleClient` peeks the first local byte under a 30s deadline, before opening any smux stream. `0x16` (TLS ClientHello) with a configured certificate: `tls.Server` (min TLS 1.2) terminates TLS and the decrypted bytes are piped as usual. `0x16` without a certificate: connection closed, debug log `tls not enabled`. Anything else is piped untouched. TLS protects only the application-to-client hop.
+
+### SOCKS5 (`pkg/socks5/socks5.go`)
 
 | Aspect | Behavior |
 |---|---|
@@ -131,6 +156,26 @@ TCP
 | Command | CONNECT only. Others: reply `0x07` |
 | Reply | Sent after the dial. Success carries the local bound address. Failures map to `0x02` blocked, `0x03` network, `0x04` host/DNS/timeout, `0x05` refused, `0x01` other |
 | Target ACL | Loopback, private, link-local, multicast and unspecified targets are refused after DNS resolution unless `--allow-private` is set |
+
+### SOCKS4 / 4a (`pkg/socks4/socks4.go`)
+
+| Aspect | Behavior |
+|---|---|
+| Request | `VN=4`, `CD=1` (CONNECT) only. BIND is rejected |
+| User ID | Read and ignored (no authentication) |
+| SOCKS4a | Destination IP `0.0.0.x` (x not 0) is followed by a NUL-terminated domain |
+| Limits | User ID and domain are each capped at 255 bytes |
+| Reply | `0x5A` granted, `0x5B` for every failure, including a blocked target |
+
+### HTTP (`pkg/httpproxy/httpproxy.go`)
+
+| Aspect | Behavior |
+|---|---|
+| `CONNECT host[:port]` | Target defaults to port 443. Reply `200 Connection established`, then raw relay |
+| Absolute-form `GET http://host/path` | Only `http` scheme, port defaults to 80. Rewritten to origin-form and written to the target, then the response is relayed |
+| Header handling | Hop-by-hop headers (`Proxy-Connection`, `Proxy-Authorization`, `Connection` and the headers it names, `Keep-Alive`, `TE`, `Trailer`, `Upgrade`, `Transfer-Encoding`) are stripped. `Connection: close` is forced, so one request per proxied connection |
+| Other requests | Origin-form or non-http schemes: `400` |
+| Failed dial | Blocked target `403`, timeout `504`, anything else `502` |
 
 ---
 
@@ -152,13 +197,16 @@ Precedence: command-line flag, then environment variable, then default. The env 
 | `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address dialed by client |
 | `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | EHLO token and XOR key. Prefer the env var: argv is visible in `ps` |
 | `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback/private/link-local targets |
+| `--tls-cert` | `PROXY_OVER_SMTP_TLS_CERT` | empty | client | PEM certificate for the TLS proxy listener |
+| `--tls-key` | `PROXY_OVER_SMTP_TLS_KEY` | empty | client | PEM key. Must be set together with `--tls-cert` |
+| `--drain-timeout` | `PROXY_OVER_SMTP_DRAIN_TIMEOUT` | `30s` | server, client | Shutdown drain limit. Negative is rejected |
 | `--log-level` | `PROXY_OVER_SMTP_LOG_LEVEL` | `info` | all | `debug`, `info`, `warn`, `error` |
 | `--log-format` | `PROXY_OVER_SMTP_LOG_FORMAT` | `text` | all | `text` or `json` |
 | `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file. Stdout only when empty |
 | `--auto-update` | `PROXY_OVER_SMTP_AUTO_UPDATE` | `false` | server, client | Periodic release check, swap and re-exec |
 | `--update-interval` | `PROXY_OVER_SMTP_UPDATE_INTERVAL` | `24h` | server, client | Check interval, minimum `1h` |
 
-Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`), `target unreachable` (warn), `shutdown complete`. Handshake and SOCKS rejections log at debug. The secret is never logged.
+Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`, `proto` = `socks5`, `socks4`, `http`, `http-connect`), `draining` (`active`, `timeout`), `target unreachable` (warn), `shutdown complete`, `drain interrupted, connections closed` (warn). Handshake and protocol rejections log at debug. The secret is never logged.
 
 ---
 
@@ -166,9 +214,19 @@ Logging: `log/slog` with structured key/value fields, written to stdout as an ev
 
 - **Accept loop:** shared by both modes. Accept errors retry with 5ms–1s backoff.
 - **Per connection:** one goroutine tracked in `Tunnel.conns`. `context.AfterFunc` closes the connection on cancel and is released when the handler returns.
-- **Per smux stream (server):** one goroutine tracked in `Tunnel.conns`: 30s deadline for SOCKS5, dial, reply, relay.
-- **Client session:** `Tunnel.sess` guarded by `sessMu`. Created lazily, re-dialed when closed. A failed stream open drops the session and retries once on a fresh one. Closed on shutdown.
-- **Shutdown:** `SIGINT`/`SIGTERM` cancels the context → listeners close, sessions close → the CLI waits up to 5s on `Tunnel.Wait()` → logs `shutdown complete` or `shutdown timed out, forcing exit`.
+- **Per smux stream (server):** one goroutine tracked in `Tunnel.conns`: 30s deadline for detection, negotiation, dial and reply, then relay.
+- **Client session:** `Tunnel.sess` guarded by `sessMu`. Created lazily, re-dialed when closed. A failed stream open drops the session and retries once on a fresh one. Closed by `Shutdown` after the drain.
+- **Active counter:** `Tunnel.Active()` is an atomic count of tracked handlers, used for the `draining` log.
+
+### Graceful drain
+
+1. `SIGINT`/`SIGTERM` cancels the run context. `RunServer`/`RunClient` only stop accepting and return. Existing connections are not touched.
+2. The CLI logs `draining` and calls `Tunnel.Shutdown(ctx)` with `--drain-timeout`. `Shutdown` waits for all tracked handlers.
+3. Server sessions refuse new streams once draining starts and close themselves when their last stream ends, so idle sessions close at once. The client keeps using its shared session for in-flight relays.
+4. When handlers finish, `Shutdown` cancels the internal hard context, closes sessions and returns nil: log `shutdown complete`.
+5. If the drain context expires, or a second signal arrives, the hard context is cancelled first. That closes every connection and session, and `Shutdown` returns the context error: warn `drain interrupted, connections closed`. A bounded grace (5s) then waits for handler goroutines to exit.
+
+Auto-update restart takes the same path before re-exec.
 
 ---
 
@@ -189,11 +247,14 @@ Logging: `log/slog` with structured key/value fields, written to stdout as an ev
 1. **Fake SMTP handshake** — first bytes look like a mail session to naive DPI.
 2. **XOR is obfuscation, not encryption** — the secret is sent in plaintext in `EHLO` and there is no TLS. Do not rely on confidentiality.
 3. **Single multiplexed session** — one TCP + handshake per client, many streams via smux. Lower latency, fewer connections.
-4. **SOCKS parsed server-side** — client stays a dumb byte pipe.
-5. **Reusable code in `pkg/`** — XOR stream, SOCKS5 and relay carry no app state. App wiring stays in `internal/`.
+4. **Protocols parsed server-side** — the client stays a dumb byte pipe, so detection on the server adds SOCKS4 and HTTP without changing the wire format. The only client-side parsing is the TLS ClientHello check, and only when a certificate is configured.
+5. **Reusable code in `pkg/`** — XOR stream, SOCKS4/5, HTTP proxy parsing and relay carry no app state. App wiring stays in `internal/`.
 6. **Stdlib first** — third-party dependencies are `xtaci/smux` (multiplexer) and `spf13/cobra` (CLI). No viper: env fallback is a small pflag walker in `internal/cli/env.go`.
 7. **Target ACL on by default** — the server is an outbound proxy for anyone holding the secret, so private ranges are blocked unless `--allow-private`. Uses stdlib predicates only (CGNAT `100.64.0.0/10` not covered).
 8. **Static builds** — `CGO_ENABLED=0`, cross-compiled by GoReleaser (darwin/linux/windows × 386/amd64/arm64). Version, commit and date are injected via ldflags.
 9. **Twelve-factor** — config only from flags and env (no default secret), logs as a stdout event stream, stateless processes, port binding via `--listen`, graceful SIGTERM drain, `version` as an admin command.
 10. **smux v2 per-stream windows** — with v1 one unread stream fills the shared session buffer and stalls every stream. Limitation: smux has no half-close, so a client that only shuts down its write side (e.g. `nc -N`) loses the response.
 11. **Self-update from stdlib** — no update library; `net/http`, `archive/zip` and `crypto/sha256` cover it. Auto-update is opt-in because it can split server and client versions.
+12. **One HTTP request per connection** — plain HTTP forwarding sets `Connection: close` and strips hop-by-hop headers. Keep-alive across different hosts would need a request loop; modern clients use `CONNECT` for HTTPS, which is a raw relay.
+13. **Drain before close** — listeners stop first and connections finish on their own, bounded by `--drain-timeout`. A second signal forces. Container and orchestrator grace periods must exceed the drain timeout.
+14. **Doc comments** — Google Go style: a package comment per package, a doc comment starting with the name on every exported and non-trivial unexported symbol, bodies comment only the why.

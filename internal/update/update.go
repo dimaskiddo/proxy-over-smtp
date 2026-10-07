@@ -1,3 +1,6 @@
+// Package update finds the latest GitHub release, downloads the archive for the running
+// platform, verifies its checksum and replaces the executable. Archive names are coupled to
+// .goreleaser.yml through assetName.
 package update
 
 import (
@@ -38,6 +41,8 @@ type Client struct {
 	API  string
 }
 
+// get fetches url and returns the body. A body over limit bytes is an error rather
+// than a silent truncation, because a truncated archive would fail its checksum anyway.
 func (c Client) get(ctx context.Context, url, accept string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -151,6 +156,7 @@ func (c Client) Apply(ctx context.Context, rel Release, exe string) error {
 	return replace(exe, bin)
 }
 
+// verify checks data against the sha256 listed for name in a checksums.txt body.
 func verify(sums []byte, name string, data []byte) error {
 	var want string
 	for _, line := range strings.Split(string(sums), "\n") {
@@ -173,6 +179,7 @@ func verify(sums []byte, name string, data []byte) error {
 	return nil
 }
 
+// extract returns the executable from a release zip held in memory.
 func extract(archive []byte) ([]byte, error) {
 	zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 	if err != nil {
@@ -247,6 +254,7 @@ func Newer(latest, current string) (bool, error) {
 	return false, nil
 }
 
+// parseVersion parses [v]X.Y.Z and ignores any "-pre" or "+meta" suffix.
 func parseVersion(v string) ([3]int, error) {
 	var out [3]int
 

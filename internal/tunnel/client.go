@@ -3,7 +3,9 @@ package tunnel
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"time"
@@ -14,23 +16,23 @@ import (
 	"github.com/dimaskiddo/proxy-over-smtp/pkg/xorstream"
 )
 
+// RunClient listens for local proxy connections and pipes each one into a stream on the
+// shared tunnel session until ctx is done. It then stops accepting and returns: open
+// transfers keep running until Shutdown drains them and closes the session.
 func (t *Tunnel) RunClient(ctx context.Context) error {
 	ln, err := net.Listen("tcp", t.cfg.Listen)
 	if err != nil {
 		return fmt.Errorf("listen client: %w", err)
 	}
 
-	t.log.Info("client listening", "listen", t.cfg.Listen, "remote", t.cfg.Remote)
+	t.log.Info("client listening", "listen", t.cfg.Listen, "remote", t.cfg.Remote, "tls", t.tlsCfg != nil)
 
-	err = t.acceptLoop(ctx, ln, func(local net.Conn) {
-		t.handleClient(ctx, local)
+	return t.acceptLoop(ctx, ln, func(local net.Conn) {
+		t.handleClient(t.hard, local)
 	})
-
-	t.closeSession()
-
-	return err
 }
 
+// closeSession closes the shared session, if any. Streams on it end with an error.
 func (t *Tunnel) closeSession() {
 	t.sessMu.Lock()
 	defer t.sessMu.Unlock()
@@ -41,7 +43,43 @@ func (t *Tunnel) closeSession() {
 	}
 }
 
+// handleClient pipes one local connection into a new tunnel stream. The first byte decides
+// whether the application speaks TLS to the proxy (0x16, a ClientHello): that is terminated
+// here when a certificate is configured, and everything else passes through untouched. The
+// peek runs before the stream opens so idle or scanning connections cost the server nothing.
 func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
+	br := bufio.NewReader(local)
+
+	if err := local.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
+		return
+	}
+
+	first, err := br.Peek(1)
+	if err != nil {
+		return
+	}
+
+	var app io.ReadWriteCloser = &bufConn{r: br, Conn: local}
+
+	if first[0] == 0x16 {
+		if t.tlsCfg == nil {
+			t.log.Debug("tls not enabled", "peer", local.RemoteAddr().String())
+			return
+		}
+
+		tc := tls.Server(app.(net.Conn), t.tlsCfg)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			t.log.Debug("tls handshake failed", "peer", local.RemoteAddr().String(), "err", err)
+			return
+		}
+
+		app = tc
+	}
+
+	if err := local.SetDeadline(time.Time{}); err != nil {
+		return
+	}
+
 	remoteStream, err := t.openStream(ctx)
 	if err != nil {
 		t.log.Warn("open stream failed", "err", err)
@@ -49,7 +87,7 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 	}
 	defer remoteStream.Close()
 
-	relay.Pipe(local, remoteStream)
+	relay.Pipe(app, remoteStream)
 }
 
 // openStream retries once on a fresh session: a peer restart leaves a dead session that
@@ -118,6 +156,8 @@ func (t *Tunnel) getSession(ctx context.Context) (*smux.Session, error) {
 	return t.sess, nil
 }
 
+// clientHandshake plays the client side of the fake SMTP session. The greeting and replies
+// are checked by prefix only; the server is the side that authenticates.
 func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) error {
 	if err := conn.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
 		return fmt.Errorf("set deadline: %w", err)

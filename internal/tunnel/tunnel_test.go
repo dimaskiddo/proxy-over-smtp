@@ -30,8 +30,15 @@ func TestHandshake(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			srv := New(config.Config{Secret: "s3cret"}, slog.New(slog.DiscardHandler))
-			cli := New(config.Config{Secret: tt.clientSecret}, slog.New(slog.DiscardHandler))
+			srv, err := New(config.Config{Secret: "s3cret"}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cli, err := New(config.Config{Secret: tt.clientSecret}, slog.New(slog.DiscardHandler))
+			if err != nil {
+				t.Fatal(err)
+			}
 
 			c, s := net.Pipe()
 			defer c.Close()
@@ -85,34 +92,80 @@ func TestIsBlocked(t *testing.T) {
 }
 
 // startPair runs a real server accept loop and returns a client Tunnel that dials it.
-func startPair(t *testing.T) *Tunnel {
+// pair is a client and a server Tunnel wired over loopback. stopServer and stopClient end
+// the accept loops without draining, like a signal does.
+type pair struct {
+	cli, srv   *Tunnel
+	cliAddr    string
+	stopServer context.CancelFunc
+	stopClient context.CancelFunc
+	srvDone    chan struct{}
+	cliDone    chan struct{}
+}
+
+func newPair(t *testing.T, cliCfg config.Config) *pair {
 	t.Helper()
 
 	log := slog.New(slog.DiscardHandler)
-	srv := New(config.Config{Secret: "s3cret", AllowPrivate: true}, log)
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	srv, err := New(config.Config{Secret: "s3cret", AllowPrivate: true}, log)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
+	sln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cliCfg.Secret = "s3cret"
+	cliCfg.Remote = sln.Addr().String()
+
+	cli, err := New(cliCfg, log)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := &pair{cli: cli, srv: srv, cliAddr: cln.Addr().String(), srvDone: make(chan struct{}), cliDone: make(chan struct{})}
+
+	var sctx, cctx context.Context
+	sctx, p.stopServer = context.WithCancel(context.Background())
+	cctx, p.stopClient = context.WithCancel(context.Background())
+
 	go func() {
-		defer close(done)
-		_ = srv.acceptLoop(ctx, ln, func(c net.Conn) { srv.handleServer(ctx, c) })
+		defer close(p.srvDone)
+		_ = srv.acceptLoop(sctx, sln, func(c net.Conn) { srv.handleServer(sctx, c) })
 	}()
 
-	cli := New(config.Config{Secret: "s3cret", Remote: ln.Addr().String()}, log)
+	go func() {
+		defer close(p.cliDone)
+		_ = cli.acceptLoop(cctx, cln, func(c net.Conn) { cli.handleClient(cli.hard, c) })
+	}()
 
 	t.Cleanup(func() {
-		cancel()
-		cli.closeSession()
-		<-done
-		srv.Wait()
+		p.stopServer()
+		p.stopClient()
+		<-p.srvDone
+		<-p.cliDone
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		_ = cli.Shutdown(ctx)
+		_ = srv.Shutdown(ctx)
 	})
 
-	return cli
+	return p
+}
+
+func startPair(t *testing.T) *Tunnel {
+	t.Helper()
+	return newPair(t, config.Config{}).cli
 }
 
 // socksConnect opens a tunnel stream and runs the SOCKS5 CONNECT exchange to target.

@@ -11,6 +11,9 @@ func TestValidate(t *testing.T) {
 		{"ok", Config{Listen: ":1", Secret: "s"}, false},
 		{"empty secret", Config{Listen: ":1"}, true},
 		{"empty listen", Config{Secret: "s"}, true},
+		{"tls pair", Config{Listen: ":1", Secret: "s", TLSCert: "c", TLSKey: "k"}, false},
+		{"tls cert only", Config{Listen: ":1", Secret: "s", TLSCert: "c"}, true},
+		{"tls key only", Config{Listen: ":1", Secret: "s", TLSKey: "k"}, true},
 	}
 
 	for _, tt := range tests {

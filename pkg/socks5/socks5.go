@@ -1,3 +1,5 @@
+// Package socks5 implements the server side of the SOCKS5 CONNECT handshake (RFC 1928) with
+// no authentication.
 package socks5
 
 import (

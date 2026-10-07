@@ -1,3 +1,6 @@
+// Command proxy-over-smtp tunnels SOCKS4/5, HTTP and HTTPS proxy traffic through a fake SMTP
+// session. This file only wires the signal context, build info and restart; the work is in
+// internal/cli.
 package main
 
 import (
@@ -11,6 +14,7 @@ import (
 	"github.com/dimaskiddo/proxy-over-smtp/internal/update"
 )
 
+// Build info, overwritten at link time through -ldflags -X by GoReleaser and the Dockerfile.
 var (
 	version = "dev"
 	commit  = "none"

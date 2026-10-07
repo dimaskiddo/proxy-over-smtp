@@ -1,3 +1,5 @@
+// Package xorstream wraps an io.ReadWriter with a rolling-key XOR. It hides plaintext from
+// naive inspection and provides no confidentiality or integrity.
 package xorstream
 
 import (
@@ -32,6 +34,7 @@ func New(rw io.ReadWriter, key string) (*Stream, error) {
 	}, nil
 }
 
+// Read reads from the inner stream and decodes the bytes in place.
 func (x *Stream) Read(p []byte) (n int, err error) {
 	x.muR.Lock()
 	defer x.muR.Unlock()
@@ -44,6 +47,8 @@ func (x *Stream) Read(p []byte) (n int, err error) {
 	return
 }
 
+// Write encodes p into a scratch buffer, so the caller's slice is never modified, and writes
+// it to the inner stream.
 func (x *Stream) Write(p []byte) (n int, err error) {
 	x.muW.Lock()
 	defer x.muW.Unlock()

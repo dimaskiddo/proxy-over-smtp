@@ -1,3 +1,4 @@
+// Package relay copies bytes between two connections with pooled buffers.
 package relay
 
 import (
@@ -5,8 +6,10 @@ import (
 	"sync"
 )
 
+// bufferSize is the size of each pooled copy buffer.
 const bufferSize = 32 * 1024
 
+// bufferPool recycles copy buffers so busy proxies do not allocate per connection.
 var bufferPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, bufferSize)

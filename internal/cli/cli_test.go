@@ -36,6 +36,9 @@ func TestCommands(t *testing.T) {
 		{"bad env bool", []string{"server"}, map[string]string{"PROXY_OVER_SMTP_ALLOW_PRIVATE": "x"}, "PROXY_OVER_SMTP_ALLOW_PRIVATE", ""},
 		{"bad log level", []string{"--log-level", "loud", "server", "--secret", "x"}, nil, "invalid log level", ""},
 		{"auto-update short interval", []string{"server", "--secret", "x", "--auto-update", "--update-interval", "10m"}, nil, "at least 1h0m0s", ""},
+		{"tls cert without key", []string{"client", "--secret", "x", "--tls-cert", "c.pem"}, nil, "set together", ""},
+		{"negative drain", []string{"server", "--secret", "x", "--drain-timeout", "-1s"}, nil, "must not be negative", ""},
+		{"bad tls files", []string{"client", "--secret", "x", "--tls-cert", "/nope/c.pem", "--tls-key", "/nope/k.pem"}, nil, "load tls key pair", ""},
 		{"update unreachable api", []string{"update", "--check", "--update-api", "http://127.0.0.1:1/x"}, nil, "check latest release", ""},
 		{"help lists env", []string{"server", "--help"}, nil, "", "$PROXY_OVER_SMTP_SECRET"},
 	}

@@ -9,6 +9,7 @@ import (
 	"runtime"
 )
 
+// oldSuffix names the file a running Windows executable is renamed to during replacement.
 const oldSuffix = ".old"
 
 // replace swaps exe for bin atomically. Windows cannot overwrite a running executable
@@ -76,6 +77,8 @@ func cleanOld(exe string) {
 	_ = os.Remove(exe + oldSuffix)
 }
 
+// wrapPerm adds a hint to permission errors, the usual failure when the binary sits in a
+// root-owned directory.
 func wrapPerm(err error) error {
 	if errors.Is(err, fs.ErrPermission) {
 		return fmt.Errorf("%w (run with sufficient permissions)", err)

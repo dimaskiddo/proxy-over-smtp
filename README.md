@@ -1,8 +1,8 @@
 # 🔒 Proxy-Over-SMTP
 
-**Proxy-Over-SMTP** is a SOCKS5 proxy tunnel that disguises its traffic as an SMTP session and XOR-obfuscates the payload to confuse Deep Packet Inspection (DPI). This project is inspired by [smtp-tunnel-proxy](https://github.com/x011/smtp-tunnel-proxy).
+**Proxy-Over-SMTP** is a SOCKS4/5, HTTP and HTTPS proxy tunnel that disguises its traffic as an SMTP session and XOR-obfuscates the payload to confuse Deep Packet Inspection (DPI). This project is inspired by [smtp-tunnel-proxy](https://github.com/x011/smtp-tunnel-proxy).
 
-A **client** exposes a local SOCKS5 port. A **server** answers a fake SMTP handshake, then carries every proxied connection as a multiplexed stream inside a single TCP connection.
+A **client** exposes one local proxy port that speaks SOCKS4/4a, SOCKS5, HTTP and HTTPS. A **server** answers a fake SMTP handshake, then carries every proxied connection as a multiplexed stream inside a single TCP connection.
 
 ---
 
@@ -31,8 +31,8 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 *   **🎭 SMTP Disguise:** Every connection opens with a plausible `220` / `EHLO` / `DATA` exchange before tunneling starts.
 *   **🧩 XOR Obfuscation:** Payload is XORed with a rolling key derived from your shared secret.
 *   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
-*   **🧦 Standard SOCKS5:** Works with browsers, `curl`, and anything that speaks SOCKS5 (IPv4, IPv6 and domain targets).
-*   **🛑 Graceful Shutdown:** Active connections drain on `SIGINT` / `SIGTERM` (5s limit).
+*   **🧦 Many Proxy Protocols, One Port:** SOCKS4/4a, SOCKS5, HTTP (plain and `CONNECT`) and HTTPS (TLS proxy listener) are auto-detected from the first byte. Works with browsers, `curl`, `git`, `apt` and anything that honors `http_proxy` / `https_proxy` or SOCKS.
+*   **🛑 Graceful Shutdown:** On `SIGINT` / `SIGTERM` the listener stops and active connections drain until done or `--drain-timeout` (default 30s). A second signal forces exit.
 *   **📝 Structured Logs:** `slog` events on stdout (text or JSON), one `tunnel opened` line per proxied connection. Optional log file.
 *   **🌱 Twelve-Factor:** All settings from flags or `PROXY_OVER_SMTP_*` env vars. The secret has no default.
 *   **📦 Static Binaries:** `CGO_ENABLED=0` builds for Linux, macOS, and Windows, plus a Docker image.
@@ -43,9 +43,9 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 
 ```mermaid
 graph LR
-    App["Browser / curl<br/>(SOCKS5)"] --> Client["Client<br/>:1080"]
+    App["Browser / curl<br/>(SOCKS4/5, HTTP, HTTPS)"] --> Client["Client<br/>:1080"]
     Client -- "fake SMTP handshake<br/>+ XOR + smux" --> Server["Server<br/>:465"]
-    Server -- "SOCKS5 negotiation<br/>per stream" --> Target["Target host"]
+    Server -- "protocol detect + negotiate<br/>per stream" --> Target["Target host"]
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/WORKFLOWS.md](docs/WORKFLOWS.md) for details.
@@ -86,7 +86,8 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and [docs/WORKFLOWS.md](docs/WO
       --rm dimaskiddo/proxy-over-smtp:latest \
       client --listen 0.0.0.0:1080 --remote 192.168.1.100:465
     ```
-4.  Point your browser to SOCKS version 5 at `127.0.0.1:1080` (or your client port).
+4.  Point your browser or tool at `127.0.0.1:1080` (or your client port) as a SOCKS or HTTP proxy. See [Using the proxy](#using-the-proxy).
+5.  Docker sends `SIGKILL` after 10s by default, which cuts the drain. Give it more time than `--drain-timeout`: `docker run --stop-timeout 35 ...`, or `stop_grace_period: 35s` in Compose. In Kubernetes set `terminationGracePeriodSeconds` above the drain timeout.
 
 The image entrypoint is `proxy-over-smtp` and the default command is `server`.
 
@@ -139,7 +140,7 @@ make release   # (Optional) Mass binaries via GoReleaser, output in dist/
 proxy-over-smtp <command> [flags]
 
   server    Run the tunnel server
-  client    Run the local SOCKS5 client
+  client    Run the local proxy client (SOCKS4/5, HTTP, HTTPS)
   update    Update this binary to the latest GitHub release
   version   Print version information (also --version)
 ```
@@ -152,17 +153,46 @@ Server and client use the same binary and the same secret. Every flag can also b
 | `--remote` | `PROXY_OVER_SMTP_REMOTE` | `127.0.0.1:465` | client | Server address the client dials |
 | `--secret` | `PROXY_OVER_SMTP_SECRET` | none, **required** | server, client | Shared secret (EHLO token and XOR key). Prefer the env var |
 | `--allow-private` | `PROXY_OVER_SMTP_ALLOW_PRIVATE` | `false` | server | Allow loopback, private and link-local targets (blocked by default) |
+| `--tls-cert` | `PROXY_OVER_SMTP_TLS_CERT` | empty | client | PEM certificate. With `--tls-key`, enables the HTTPS (TLS) proxy listener |
+| `--tls-key` | `PROXY_OVER_SMTP_TLS_KEY` | empty | client | PEM private key for `--tls-cert`. Both or neither |
+| `--drain-timeout` | `PROXY_OVER_SMTP_DRAIN_TIMEOUT` | `30s` | server, client | Max time to let active connections finish on shutdown. `0` closes them at once |
 | `--log-level` | `PROXY_OVER_SMTP_LOG_LEVEL` | `info` | all | `debug`, `info`, `warn`, `error` |
 | `--log-format` | `PROXY_OVER_SMTP_LOG_FORMAT` | `text` | all | `text` or `json` |
 | `--log-file` | `PROXY_OVER_SMTP_LOG_FILE` | empty | all | Also append logs to this file |
 | `--auto-update` | `PROXY_OVER_SMTP_AUTO_UPDATE` | `false` | server, client | Check for new releases, install and restart in place |
 | `--update-interval` | `PROXY_OVER_SMTP_UPDATE_INTERVAL` | `24h` | server, client | Auto-update check interval, minimum `1h` |
 
-Quick check through the client:
+### 🧭 Using the proxy
+
+The client port detects the protocol per connection, so one `--listen` serves all of these:
 
 ```sh
-curl --socks5-hostname 127.0.0.1:1080 https://example.com
+curl -x socks5h://127.0.0.1:1080 https://example.com    # SOCKS5, DNS on the server
+curl -x socks4a://127.0.0.1:1080 https://example.com    # SOCKS4a, DNS on the server
+curl -x socks4://127.0.0.1:1080  https://203.0.113.5    # SOCKS4, IPv4 targets only
+curl -x http://127.0.0.1:1080    http://example.com     # HTTP proxy, plain request
+curl -x http://127.0.0.1:1080    https://example.com    # HTTP proxy, CONNECT
+export http_proxy=http://127.0.0.1:1080 https_proxy=http://127.0.0.1:1080
+git ls-remote https://github.com/dimaskiddo/proxy-over-smtp
 ```
+
+**HTTPS proxy (TLS to the client).** Give the client a certificate and `https://` proxy URLs work on the same port. Plain connections keep working.
+
+```sh
+proxy-over-smtp client --tls-cert proxy.crt --tls-key proxy.key --remote 192.168.1.100:465
+curl -x https://127.0.0.1:1080 --proxy-cacert proxy.crt https://example.com
+```
+
+Notes:
+
+- No proxy authentication. SOCKS4 `USERID` and `Proxy-Authorization` are ignored, so bind the client to a trusted interface.
+- Plain HTTP requests use one request per connection (`Connection: close`), and only `http://` absolute-form requests are proxied.
+- HTTP and SOCKS refusals map as: blocked target is `403` / SOCKS5 `0x02`, timeout is `504`, other failures `502`. SOCKS4 always replies `0x5B`.
+- The certificate loads once at start. Restart to rotate it. TLS covers only the hop from your application to the client. The client-to-server tunnel is unchanged.
+
+### 🛑 Graceful shutdown
+
+`SIGINT` / `SIGTERM` stops accepting new connections, then waits for active ones to finish, up to `--drain-timeout`. Logs show `draining active=N`, then `shutdown complete`. At the deadline, or on a second signal, remaining connections are closed and the log shows `drain interrupted, connections closed`. On the server, idle tunnels close at once and the client re-dials on its next connection.
 
 ### 🔄 Updating
 
@@ -189,11 +219,11 @@ Notes:
 Logs are an event stream on stdout. Redirect or collect them with your process manager (Docker, systemd, Kubernetes). `--log-file` additionally appends to a file.
 
 ```
-time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113.5:56810 target=example.com:443
+time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113.5:56810 target=example.com:443 proto=socks5
 time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" target=10.0.0.1:80 err="dial tcp 10.0.0.1:80: target address not allowed"
 ```
 
-`--log-format json` emits the same events as JSON lines. Handshake and SOCKS rejections appear at `--log-level debug`. The secret is never logged.
+`--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged.
 
 ---
 

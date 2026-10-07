@@ -20,6 +20,7 @@ const (
 	updateTimeout     = 2 * time.Minute
 )
 
+// errDevBuild is returned when update runs on a build without a release version.
 var errDevBuild = errors.New("dev build has no comparable version: use --force")
 
 // updateOpts holds the auto-update flags shared by server and client.
@@ -29,6 +30,7 @@ type updateOpts struct {
 	api      string
 }
 
+// bind registers the auto-update flags on cmd.
 func (o *updateOpts) bind(cmd *cobra.Command) {
 	f := cmd.Flags()
 	f.BoolVar(&o.enabled, "auto-update", false, "Check GitHub releases periodically, install a newer one and restart")
@@ -37,6 +39,7 @@ func (o *updateOpts) bind(cmd *cobra.Command) {
 	_ = f.MarkHidden("update-api")
 }
 
+// validate rejects an interval below minUpdateInterval so a typo cannot hammer the GitHub API.
 func (o *updateOpts) validate() error {
 	if o.enabled && o.interval < minUpdateInterval {
 		return fmt.Errorf("update interval must be at least %s", minUpdateInterval)
@@ -45,6 +48,7 @@ func (o *updateOpts) validate() error {
 	return nil
 }
 
+// updateClient returns an update client for api with the update timeout applied.
 func updateClient(api string) update.Client {
 	return update.Client{HTTP: &http.Client{Timeout: updateTimeout}, API: api}
 }
@@ -64,6 +68,8 @@ func executablePath() (string, error) {
 	return exe, nil
 }
 
+// newUpdate returns the update command. With --check it only reports; otherwise it installs
+// the latest release over the running executable.
 func newUpdate(info BuildInfo) *cobra.Command {
 	var (
 		check, force bool

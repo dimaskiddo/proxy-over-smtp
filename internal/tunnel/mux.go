@@ -6,6 +6,8 @@ import (
 	"github.com/xtaci/smux"
 )
 
+// muxConfig returns the smux settings both sides must share. Changing any value except the
+// timeouts is a wire break between client and server.
 func muxConfig() *smux.Config {
 	conf := smux.DefaultConfig()
 

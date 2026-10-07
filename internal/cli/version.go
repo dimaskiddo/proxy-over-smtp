@@ -34,6 +34,7 @@ func (b BuildInfo) resolved() (version, commit string) {
 	return v, c
 }
 
+// String formats the build info as a single human-readable line.
 func (b BuildInfo) String() string {
 	v, c := b.resolved()
 

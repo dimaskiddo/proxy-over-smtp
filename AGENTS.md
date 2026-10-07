@@ -1,6 +1,6 @@
 # Proxy-Over-SMTP — Agent Instructions
 
-SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux multiplexing, to disguise traffic from Deep Packet Inspection (DPI). Never guess protocol behavior — ask when ambiguous.
+SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with XOR-obfuscated smux multiplexing, to disguise traffic from Deep Packet Inspection (DPI). Never guess protocol behavior — ask when ambiguous.
 
 ---
 
@@ -27,8 +27,10 @@ SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux mult
 | **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `assetName` mirrors `.goreleaser.yml` archive names |
-| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream SOCKS5 + dial. `mux.go`: smux config |
+| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, shared smux session, SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial. `Shutdown(ctx)` drains. `mux.go`: smux config |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
+| **SOCKS4** | `pkg/socks4/` — SOCKS4/4a request parser and reply writer (CONNECT only) |
+| **HTTP proxy** | `pkg/httpproxy/` — CONNECT and absolute-form parser, status writer, forwarder |
 | **Relay** | `pkg/relay/` — bidirectional copy with pooled 32KB buffers |
 | **XOR Stream** | `pkg/xorstream/` — rolling-key XOR `io.ReadWriter` wrapper (obfuscation only) |
 
@@ -36,8 +38,8 @@ SOCKS5 proxy tunneled through a fake SMTP session, with XOR-obfuscated smux mult
 
 ```
 proxy-over-smtp [--log-level info] [--log-format text] [--log-file ""] <command>
-  server   --listen 0.0.0.0:465  --secret S [--allow-private]
-  client   --listen 0.0.0.0:1080 --remote 127.0.0.1:465 --secret S
+  server   --listen 0.0.0.0:465  --secret S [--allow-private] [--drain-timeout 30s]
+  client   --listen 0.0.0.0:1080 --remote 127.0.0.1:465 --secret S [--tls-cert C --tls-key K] [--drain-timeout 30s]
   update   [--check] [--force]
   version  (also --version)
 ```
@@ -60,7 +62,7 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 - Handshake, XOR, or smux changes must land in client and server together. Old and new binaries do not interoperate — say so in the commit message.
 
 ### Context & Concurrency
-- `context.Context` first param of long-running functions. Graceful shutdown via signal + context cancel.
+- `context.Context` first param of long-running functions. Graceful shutdown: signal cancels the run context (stop accepting), then `Tunnel.Shutdown` drains up to `--drain-timeout`. A second signal forces.
 - Every goroutine has an exit path. Shared state behind a mutex. Connection goroutines tracked in `Tunnel.conns`.
 
 ### Error Handling
@@ -89,10 +91,12 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 1. **No stubs.** Every function complete, production-ready.
 2. **No guessing** on protocol behavior or ambiguous architecture. Pause, state ambiguity, ask.
 3. **Never run** `make release`, `make publish`, `git push`, or commit without being asked.
-4. **Minimal comments.** Comments describe WHY, never WHAT or HOW.
-   - No step-by-step descriptions, no section separators (`// --- Section ---`), no comments restating code.
-   - Go doc comments on exported symbols: one line for simple, max three for complex.
+4. **Google Go style comments.**
+   - Every package has a package comment (`// Package x ...`, `// Command x ...` for main) in its main file.
+   - Every exported identifier and every non-trivial unexported function has a doc comment: a full sentence starting with the identifier name, stating the contract and the why.
+   - Function bodies carry WHY comments only: no step-by-step descriptions, no section separators, no comments restating code.
    - No comment revealing evasion detail beyond `docs/ARCHITECTURE.md`.
+5. **Docs follow code.** Every feature change updates README, `docs/ARCHITECTURE.md`, `docs/WORKFLOWS.md` and this file in the same change.
 
 ## Known Deviations
 
@@ -114,6 +118,8 @@ proxy-over-smtp/
 │   └── update/           # Self-update: release lookup, verify, replace, re-exec
 ├── pkg/
 │   ├── relay/            # Bidirectional pipe
+│   ├── httpproxy/        # HTTP proxy request parser, forwarder (+ test)
+│   ├── socks4/           # SOCKS4/4a parser (+ test)
 │   ├── socks5/           # SOCKS5 server negotiation
 │   └── xorstream/        # XOR stream (+ test)
 ├── docs/
@@ -141,4 +147,4 @@ proxy-over-smtp/
 | `Makefile` | Build targets |
 | `.goreleaser.yml` | Release config (darwin/linux/windows × 386/amd64/arm64) |
 | `internal/tunnel/` | Client and server implementation |
-| `pkg/` | Reusable SOCKS5, relay, XOR stream |
+| `pkg/` | Reusable SOCKS4/5, HTTP proxy, relay, XOR stream |

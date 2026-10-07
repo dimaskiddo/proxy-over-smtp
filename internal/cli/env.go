@@ -9,8 +9,11 @@ import (
 	"github.com/spf13/pflag"
 )
 
+// envPrefix namespaces every environment variable the CLI reads.
 const envPrefix = "PROXY_OVER_SMTP_"
 
+// envName returns the environment variable that backs flag, for example "log-level" maps to
+// PROXY_OVER_SMTP_LOG_LEVEL.
 func envName(flag string) string {
 	return envPrefix + strings.ToUpper(strings.ReplaceAll(flag, "-", "_"))
 }
