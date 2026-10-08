@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
@@ -109,7 +110,16 @@ func (t *Tunnel) handleClient(ctx context.Context, local net.Conn) {
 	up, down := relay.PipeCount(app, remoteStream)
 
 	t.log.Info("connection closed",
-		"peer", peer, "up", up, "down", down, "dur", time.Since(start).Round(time.Millisecond).String())
+		"peer", peer, "up", megabytes(up), "down", megabytes(down),
+		"dur", time.Since(start).Round(time.Millisecond).String())
+}
+
+// megabytes renders a byte count for the client's audit line. The unit is 10^6 bytes rather than
+// 2^20, because the label says MB and the number has to mean the same thing. Three decimals keep a
+// transfer smaller than a megabyte visible instead of rounding it to zero, and the fixed width keeps
+// one column readable down a page of events.
+func megabytes(n int64) string {
+	return strconv.FormatFloat(float64(n)/1e6, 'f', 3, 64) + " MB"
 }
 
 // dialSession dials the server, runs the handshake and wraps the connection in a new session.
@@ -153,9 +163,10 @@ func (t *Tunnel) dialSession(ctx context.Context) (*smux.Session, error) {
 	return sess, nil
 }
 
-// clientHandshake plays the client side of the fake SMTP session. It parses the server nonce,
-// answers with the HMAC proof and returns the nonce for key derivation. The greeting and the
-// final replies are checked by prefix only; the server is the side that authenticates.
+// clientHandshake plays the client side of the fake SMTP session. It reads the server nonce from
+// the greeting, sends a conforming envelope with the HMAC proof as the X-PROOF parameter on MAIL
+// FROM, and returns the nonce for key derivation. Replies are checked by prefix only: the server
+// is the side that authenticates.
 func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error) {
 	if err := conn.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
@@ -176,25 +187,28 @@ func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error)
 		return nil, fmt.Errorf("bad server nonce")
 	}
 
-	if _, err := fmt.Fprintf(conn, "EHLO %s\r\n", proofValue(t.cfg.Secret, nonce)); err != nil {
+	if _, err := fmt.Fprintf(conn, "EHLO %s\r\n", ehloHost); err != nil {
 		return nil, fmt.Errorf("write ehlo: %w", err)
 	}
 
-	// The reply is one or more 250- continuation lines followed by a final 250. The cap keeps a
-	// peer from holding the handshake open with continuations forever.
-	for i := 0; ; i++ {
-		if i >= maxReplyLines {
-			return nil, fmt.Errorf("too many 250 replies")
-		}
+	if err := readReply(r); err != nil {
+		return nil, err
+	}
 
-		line, err = readLine(r, maxLine)
-		if err != nil {
-			return nil, fmt.Errorf("read 250: %w", err)
-		}
+	if _, err := fmt.Fprintf(conn, "%s\r\n", mailCommand(t.cfg.Secret, nonce)); err != nil {
+		return nil, fmt.Errorf("write mail: %w", err)
+	}
 
-		if strings.HasPrefix(line, "250 ") {
-			break
-		}
+	if err := readReply(r); err != nil {
+		return nil, err
+	}
+
+	if _, err := fmt.Fprintf(conn, "RCPT TO:<%s>\r\n", rcptTo); err != nil {
+		return nil, fmt.Errorf("write rcpt: %w", err)
+	}
+
+	if err := readReply(r); err != nil {
+		return nil, err
 	}
 
 	if _, err := fmt.Fprintf(conn, "DATA\r\n"); err != nil {
@@ -215,4 +229,26 @@ func (t *Tunnel) clientHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error)
 	}
 
 	return nonce, nil
+}
+
+// readReply reads one 250 reply. Every step from EHLO onwards takes the same answer, but EHLO may
+// send continuations, so it runs to the first final line. The cap keeps a peer from holding the
+// handshake open with continuations forever, and any other code fails at once rather than waiting
+// for a close.
+func readReply(r *bufio.Reader) error {
+	for i := 0; i < maxReplyLines; i++ {
+		line, err := readLine(r, maxLine)
+		if err != nil {
+			return fmt.Errorf("read 250: %w", err)
+		}
+
+		switch {
+		case strings.HasPrefix(line, "250 "):
+			return nil
+		case !strings.HasPrefix(line, "250-"):
+			return fmt.Errorf("unexpected reply")
+		}
+	}
+
+	return fmt.Errorf("too many 250 replies")
 }

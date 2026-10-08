@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -64,6 +66,325 @@ func TestHandshake(t *testing.T) {
 				t.Fatalf("server err = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// startServerHandshake runs serverHandshake over one end of a pipe and returns the peer end, a
+// reader over it and the channel the server's result arrives on.
+func startServerHandshake(t *testing.T, secret string) (net.Conn, *bufio.Reader, chan error) {
+	t.Helper()
+
+	srv, err := New(config.Config{Secret: secret, Cipher: config.CipherAES}, slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c, s := net.Pipe()
+	t.Cleanup(func() { c.Close() })
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := srv.serverHandshake(s, bufio.NewReader(s))
+		s.Close()
+		errCh <- err
+	}()
+
+	return c, bufio.NewReader(c), errCh
+}
+
+// readGreeting consumes the 220 line and returns the nonce it carries.
+func readGreeting(t *testing.T, r *bufio.Reader) []byte {
+	t.Helper()
+
+	greeting, err := readLine(r, maxLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fields := strings.Fields(greeting)
+	if len(fields) != 4 || fields[0] != "220" || fields[1] != mailHost || fields[2] != "ESMTP" {
+		t.Fatalf("greeting = %q, want 220 %s ESMTP <nonce>", greeting, mailHost)
+	}
+
+	nonce, err := base64.StdEncoding.DecodeString(fields[3])
+	if err != nil || len(nonce) != nonceLen {
+		t.Fatalf("greeting nonce = %q: %v", fields[3], err)
+	}
+
+	return nonce
+}
+
+// sendLine writes one handshake line with its terminator.
+func sendLine(t *testing.T, w io.Writer, line string) {
+	t.Helper()
+
+	if _, err := io.WriteString(w, line+"\r\n"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// wantReply asserts the next reply line equals want.
+func wantReply(t *testing.T, r *bufio.Reader, want string) {
+	t.Helper()
+
+	got, err := readLine(r, maxLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got != want {
+		t.Fatalf("reply = %q, want %q", got, want)
+	}
+}
+
+// TestHandshakeTranscript pins the handshake wire bytes. A scripted client sends the exact lines a
+// conforming SMTP client sends and asserts every reply, so a change to any envelope line fails
+// here rather than only turning up against a real parser.
+func TestHandshakeTranscript(t *testing.T) {
+	c, r, errCh := startServerHandshake(t, "s3cret")
+
+	nonce := readGreeting(t, r)
+
+	sendLine(t, c, "EHLO "+ehloHost)
+	wantReply(t, r, "250-"+mailHost)
+	wantReply(t, r, "250 "+extKeyword)
+
+	sendLine(t, c, mailCommand("s3cret", nonce))
+	wantReply(t, r, "250 OK")
+
+	sendLine(t, c, "RCPT TO:<"+rcptTo+">")
+	wantReply(t, r, "250 OK")
+
+	sendLine(t, c, "DATA")
+
+	got, err := readLine(r, maxLine)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.HasPrefix(got, "354 ") {
+		t.Fatalf("data reply = %q, want a 354", got)
+	}
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("server handshake: %v", err)
+	}
+}
+
+// TestHandshakeProbeReplies checks what a peer that does not open a session gets back. A bad proof
+// must be answered with the same bytes as an unknown command, so no reply tells a probe which it
+// sent; a command a real server answers but does not act on gets its own reply, and QUIT ends the
+// session cleanly.
+func TestHandshakeProbeReplies(t *testing.T) {
+	tests := []struct {
+		name string
+		pre  func(t *testing.T, c net.Conn, r *bufio.Reader)
+		send string
+		want string
+	}{
+		{"unknown command", nil, "FOO bar", replySyntax},
+		{"known verb without argument", nil, "EHLO", replyParam},
+		{"known verb with a bare argument separator", nil, "HELO ", replyParam},
+		{"known verb with extra arguments", nil, "EHLO a b", replyParam},
+		{"bad proof", sendEHLO, mailCommand("wrong", bytes.Repeat([]byte{0x11}, nonceLen)), replySyntax},
+		{"noop", nil, "NOOP", replyOK},
+		{"noop lower case", nil, "noop", replyOK},
+		{"rset", nil, "RSET", replyOK},
+		{"vrfy", nil, "VRFY <no-reply@gmail.com>", replyUnimplemented},
+		{"expn", nil, "EXPN list", replyUnimplemented},
+		{"help", nil, "HELP", replyUnimplemented},
+		{"quit", nil, "QUIT", replyBye},
+		{"quit lower case with arguments", nil, "quit please", replyBye},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, r, errCh := startServerHandshake(t, "s3cret")
+
+			readGreeting(t, r)
+
+			if tt.pre != nil {
+				tt.pre(t, c, r)
+			}
+
+			sendLine(t, c, tt.send)
+			wantReply(t, r, tt.want)
+
+			if err := <-errCh; err == nil {
+				t.Fatal("server handshake accepted a probe")
+			}
+		})
+	}
+}
+
+// sendEHLO opens the session and asserts the two reply lines it draws.
+func sendEHLO(t *testing.T, c net.Conn, r *bufio.Reader) {
+	t.Helper()
+
+	sendLine(t, c, ehloLine)
+	wantReply(t, r, "250-"+mailHost)
+	wantReply(t, r, "250 "+extKeyword)
+}
+
+// sendMail sends the sender line carrying the proof for nonce and asserts it is accepted.
+func sendMail(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+	t.Helper()
+
+	sendLine(t, c, mailCommand("s3cret", nonce))
+	wantReply(t, r, replyOK)
+}
+
+// openEnvelope walks the transaction to the point where DATA is expected.
+func openEnvelope(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+	t.Helper()
+
+	sendEHLO(t, c, r)
+	sendMail(t, c, r, nonce)
+
+	sendLine(t, c, rcptLine)
+	wantReply(t, r, replyOK)
+}
+
+// titleCase renders a line the way a peer that capitalized only the command would, so the mixed-case
+// path is exercised without hand-writing every command a second time.
+func titleCase(s string) string {
+	return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
+}
+
+// TestHandshakeCaseInsensitive checks the commands a real server accepts in any case (RFC 5321 §2.4),
+// HELO as an alias for EHLO, and any argument on the opening command, since the name belongs to the
+// client and §4.1.4 forbids refusing mail over it. Only the fixed part of a line is folded: the proof
+// is a base64 string compared byte for byte, so folding it would reject a session the client opened
+// correctly.
+func TestHandshakeCaseInsensitive(t *testing.T) {
+	tests := []struct {
+		name  string
+		greet string
+		fold  func(string) string
+	}{
+		{"lower case", strings.ToLower(ehloLine), strings.ToLower},
+		{"upper case", strings.ToUpper(ehloLine), strings.ToUpper},
+		{"title case", titleCase(ehloLine), titleCase},
+		{"helo", "HELO " + ehloHost, func(s string) string { return s }},
+		{"other name", "EHLO mail.example.org", func(s string) string { return s }},
+		{"bare address literal", "ehlo [203.0.113.9]", func(s string) string { return s }},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, r, errCh := startServerHandshake(t, "s3cret")
+
+			nonce := readGreeting(t, r)
+
+			sendLine(t, c, tt.greet)
+			wantReply(t, r, "250-"+mailHost)
+			wantReply(t, r, "250 "+extKeyword)
+
+			sendLine(t, c, tt.fold(mailPrefix)+proofValue("s3cret", nonce))
+			wantReply(t, r, replyOK)
+
+			sendLine(t, c, tt.fold(rcptLine))
+			wantReply(t, r, replyOK)
+
+			sendLine(t, c, tt.fold("DATA"))
+			wantReply(t, r, "354 End data with <CR><LF>.<CR><LF>")
+
+			if err := <-errCh; err != nil {
+				t.Fatalf("server handshake: %v", err)
+			}
+		})
+	}
+}
+
+// TestHandshakeSequencing checks the reply for a command that arrives at the wrong stage. A real
+// server answers those with a sequence error, never with the unknown-command reply, so the reply
+// follows from the verb and says nothing about the proof.
+func TestHandshakeSequencing(t *testing.T) {
+	tests := []struct {
+		name string
+		run  func(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte)
+	}{
+		{"sender before the greeting", func(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+			sendLine(t, c, mailCommand("s3cret", nonce))
+			wantReply(t, r, replySequence)
+		}},
+		{"recipient before the sender", func(t *testing.T, c net.Conn, r *bufio.Reader, _ []byte) {
+			sendEHLO(t, c, r)
+			sendLine(t, c, rcptLine)
+			wantReply(t, r, replySequence)
+		}},
+		{"data before the sender", func(t *testing.T, c net.Conn, r *bufio.Reader, _ []byte) {
+			sendEHLO(t, c, r)
+			sendLine(t, c, "DATA")
+			wantReply(t, r, replySequence)
+		}},
+		{"second sender", func(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+			sendEHLO(t, c, r)
+			sendMail(t, c, r, nonce)
+			sendLine(t, c, mailCommand("s3cret", nonce))
+			wantReply(t, r, replySequence)
+		}},
+		{"data before the recipient", func(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+			sendEHLO(t, c, r)
+			sendMail(t, c, r, nonce)
+			sendLine(t, c, "DATA")
+			wantReply(t, r, replySequence)
+		}},
+		{"noop instead of data", func(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+			openEnvelope(t, c, r, nonce)
+			sendLine(t, c, "NOOP")
+			wantReply(t, r, replyOK)
+		}},
+		{"vrfy instead of data", func(t *testing.T, c net.Conn, r *bufio.Reader, nonce []byte) {
+			openEnvelope(t, c, r, nonce)
+			sendLine(t, c, "VRFY <no-reply@gmail.com>")
+			wantReply(t, r, replyUnimplemented)
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, r, errCh := startServerHandshake(t, "s3cret")
+
+			tt.run(t, c, r, readGreeting(t, r))
+
+			if err := <-errCh; err == nil {
+				t.Fatal("server handshake accepted an out-of-order command")
+			}
+		})
+	}
+}
+
+// TestHandshakeSilentClose checks the one failure that gets no reply: a peer that closes without
+// sending a line. Nothing arrived that could be answered, and a reply there would only tell a probe
+// its silence was noticed.
+func TestHandshakeSilentClose(t *testing.T) {
+	c, r, errCh := startServerHandshake(t, "s3cret")
+
+	readGreeting(t, r)
+	c.Close()
+
+	if err := <-errCh; !errors.Is(err, io.EOF) {
+		t.Fatalf("err = %v, want io.EOF", err)
+	}
+}
+
+// TestHandshakeBareLF checks that a line ended by a bare LF is refused with the same reply any other
+// malformed line gets. RFC 5321 §4.1.1.4 tells servers not to accept that form, and answering it
+// differently would describe the input rather than refuse it.
+func TestHandshakeBareLF(t *testing.T) {
+	c, r, errCh := startServerHandshake(t, "s3cret")
+
+	readGreeting(t, r)
+
+	if _, err := io.WriteString(c, "EHLO x\n"); err != nil {
+		t.Fatal(err)
+	}
+
+	wantReply(t, r, replySyntax)
+
+	if err := <-errCh; !errors.Is(err, errBareLF) {
+		t.Fatalf("err = %v, want errBareLF", err)
 	}
 }
 
@@ -303,12 +624,34 @@ func TestClientConnectionLog(t *testing.T) {
 		t.Fatalf("client line missing the local peer in %q", line)
 	}
 
-	if !strings.Contains(line, "up=") || !strings.Contains(line, "down=") {
+	if !strings.Contains(line, "up=") || !strings.Contains(line, "down=") || !strings.Contains(line, " MB") {
 		t.Fatalf("client line missing transfer counts in %q", line)
 	}
 
 	if strings.Contains(line, "target=") || strings.Contains(line, echoAddr) {
 		t.Fatalf("client line leaks the target in %q", line)
+	}
+}
+
+// TestMegabytes pins the audit line's unit: MB means 10^6 bytes, and the fixed three decimals keep
+// a sub-megabyte transfer readable instead of rounding it away.
+func TestMegabytes(t *testing.T) {
+	tests := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0.000 MB"},
+		{5386, "0.005 MB"},
+		{999999, "1.000 MB"},
+		{1000000, "1.000 MB"},
+		{1048576, "1.049 MB"},
+		{2500000, "2.500 MB"},
+	}
+
+	for _, tt := range tests {
+		if got := megabytes(tt.n); got != tt.want {
+			t.Errorf("megabytes(%d) = %q, want %q", tt.n, got, tt.want)
+		}
 	}
 }
 

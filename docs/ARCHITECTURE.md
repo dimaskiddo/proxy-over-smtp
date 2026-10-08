@@ -78,7 +78,7 @@ sequenceDiagram
 | **CLI** | `internal/cli/` | Cobra commands (`server`, `client`, `version`, `update`), env-to-flag fallback, `slog` logger, graceful drain |
 | **Tunnel** | `internal/tunnel/` | `Tunnel` struct: config, `*slog.Logger`, TLS config, connection `WaitGroup`, active counter, hard-stop context, client session pool. `Shutdown` drains |
 | **Pool** | `internal/tunnel/pool.go` | Client-only: the slots, pick/grow/shrink, per-stream reservation. See §1.1 |
-| **Handshake** | `internal/tunnel/handshake.go` | Challenge-response over the fake SMTP session, key derivation, capped line reads |
+| **Handshake** | `internal/tunnel/handshake.go` | RFC 5321 envelope constants, challenge-response proof, key derivation, capped line reads. See §2 |
 | **Cipher** | `internal/tunnel/cipher.go` | Picks the XOR or AES stream wrapper for a session |
 | **Client** | `internal/tunnel/client.go` | Local listener. Does **not** parse proxy protocols: pipes raw local bytes into a new smux stream, so the server answers the handshake. Only exception: terminates TLS when `--tls-cert`/`--tls-key` are set and the first byte is a TLS ClientHello |
 | **Server** | `internal/tunnel/server.go` | Listener, SMTP handshake, smux server, per-stream protocol detection + negotiation + dial + relay |
@@ -114,17 +114,32 @@ Both count ceilings are honest ones: the pool multiplies *aggregate* throughput,
 
 The server sends a fresh 32-byte nonce; the client proves knowledge of the secret with an HMAC instead of sending it. All reads and writes run under a 30s deadline, cleared after `354`.
 
-| Step | Direction | Bytes | Check |
-|---|---|---|---|
-| 1 | S→C | `220 mail.google.com ESMTP <b64-nonce>` | Client requires prefix `220`, then base64-decodes a 32-byte nonce |
-| 2 | C→S | `EHLO <b64-proof>` | Server recomputes `HMAC-SHA256(secret, "ehlo"‖nonce)` and compares the whole line in constant time |
-| 3 | S→C | `250-OK` / `250 STARTTLS` | Client reads until a line starting `250 ` |
-| 4 | C→S | `DATA` | Server requires the line to equal `DATA` |
-| 5 | S→C | `354 Go ahead` | Client requires prefix `354` |
+Every client line is a well-formed RFC 5321 command, so the session reads as an ordinary mail transaction rather than a bespoke protocol. The proof rides as the `X-PROOF` extension parameter on `MAIL FROM`, the one field where a visible string is legal, encoded as unpadded base64 so the value matches the `esmtp-value` grammar.
 
-Any failure closes the connection with no reply. `STARTTLS` is advertised only for disguise: no TLS follows.
+Commands are matched the way RFC 5321 §2.4 requires, case-insensitively, and `HELO` is accepted as an alias for `EHLO` — a relay that answered only `EHLO` would look newer than the mail server it imitates. The opening argument is not judged beyond its presence: §4.1.4 lets a server compare the name with the peer address but forbids refusing a message when that fails, so any single argument is accepted and a missing one draws the `501` a real relay sends. The proof is the exception to all folding: it is base64, so it is compared byte for byte.
 
-Every line read is capped at 4KB and the client accepts at most 16 `250-` continuation lines, so an unauthenticated peer cannot drive memory growth inside the 30s window. The proxy request path has its own 64KB cap (see [Proxy Protocols](#4-proxy-protocols)).
+| Step | Direction | Bytes | Check | RFC 5321 |
+|---|---|---|---|---|
+| 1 | S→C | `220 smtp.gmail.com ESMTP <b64-nonce>` | Client requires prefix `220`, then base64-decodes a 32-byte nonce | §4.1.1.1, §4.2 |
+| 2 | C→S | `EHLO [192.0.2.10]` | Server accepts the line in any case with any single argument — the name belongs to the client (§4.1.4) — and takes `HELO` in place of `EHLO`; a missing argument gets `501` | §4.1.1.1 |
+| 3a | S→C | `250-smtp.gmail.com` | First line of the `ehlo-ok-rsp` | §4.1.1.1 |
+| 3b | S→C | `250 X-PROOF` | Client reads until a line starting `250 ` | §4.1.1.1, §2.2.2 |
+| 4 | C→S | `MAIL FROM:<no-reply@gmail.com> X-PROOF=<b64-proof>` | Server matches the fixed prefix case-insensitively, then compares the proof parameter against `HMAC-SHA256(secret, "ehlo"‖nonce)` in unpadded base64, in constant time | §4.1.1.2 |
+| 5 | S→C | `250 OK` | Client requires prefix `250` | §4.2 |
+| 6 | C→S | `RCPT TO:<no-reply@gmail.com>` | Server accepts this line in any case | §4.1.1.3 |
+| 7 | S→C | `250 OK` | Client requires prefix `250` | §4.2 |
+| 8 | C→S | `DATA` | Server accepts this command in any case | §4.1.1.4 |
+| 9 | S→C | `354 End data with <CR><LF>.<CR><LF>` | Client requires prefix `354` | §4.1.1.4 |
+
+Failures are answered the way a real server answers them. `250 OK` acknowledges `NOOP` and `RSET`, which change no transaction state. `502 Command not implemented` refuses `VRFY`, `EXPN` and `HELP` — RFC 5321 §4.2.4 puts a recognized command the server does not offer on 502, not on 500. `500 Syntax error, command unrecognized` answers a malformed line and a bad proof with identical bytes, so no reply says which fired. A line ended by a bare LF and a line over 4KB are both malformed: RFC 5321 §4.1.1.4 says a server must not accept the first, and §4.2.2 counts the second as a syntax error. `501 Syntax error in parameters or arguments` answers a recognized opening verb whose argument is missing, which is the code a real relay returns for a bare `EHLO`; an argument that is present is never judged, since §4.1.4 forbids refusing a message over the name a client gives. `503 Bad sequence of commands` answers a command that arrives out of order: a transaction verb before the greeting, `RCPT` or `DATA` before the sender, a second `MAIL` before the recipient, or anything but `DATA` at the last step. The verb is checked before the proof at every stage, so the reply follows from the command and never from the secret. A pre-`354` `QUIT` gets `221 Bye` and a clean close. Every reply is the last thing the session sends: a real server keeps the connection open after `250` or `502`, and this one closes, so a probe gets one answer per connection. Only a failure with no reply to give (I/O error, timeout, peer close) closes silently.
+
+Only what is implemented is advertised: the `X-PROOF` keyword alone. `STARTTLS` is deliberately absent — advertising a refused extension is a signature mismatch, and a client taking it per RFC 3207 would hang.
+
+**Intentional deviation.** The envelope through `354` is RFC 5321 syntax in RFC 5321 order, but the DATA body cannot be: the stream is a raw bidirectional tunnel with no dot-stuffing and no `CRLF.CRLF` terminator. There is no message to end, because the payload is an indefinite byte stream. The envelope is the disguise; the body is not pretending to be mail.
+
+Envelope values are constants in `handshake.go`. They are as fingerprintable as any other constant here; deriving them would break the ordinary-mail narrative for no gain.
+
+Every line read must be CRLF-terminated (RFC 5321 §4.1.1.4; a bare LF is refused) and is capped at 4KB — a lenient superset of the RFC 5321 §4.5.3.1.4 512-octet command line limit — and the client accepts at most 16 `250-` continuation lines, so an unauthenticated peer cannot drive memory growth inside the 30s window. An over-long line is answered with one `500` before the close. The proxy request path has its own 64KB cap (see [Proxy Protocols](#4-proxy-protocols)).
 
 **Key derivation.** Both sides derive the stream keys from the secret and the nonce, so nothing secret travels and every connection gets its own keys:
 
@@ -316,7 +331,7 @@ Precedence: command-line flag, then environment variable, then default. The env 
 
 `--listen` and `--remote` are checked for `host:port` shape at startup, so a malformed address fails immediately instead of at bind time. Names are not resolved during validation: a transient DNS failure must not stop startup.
 
-Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Key events: `server listening`, `client listening`, `tunnel opened` (`peer`, `target`, `proto` = `socks5`, `socks4`, `http`, `http-connect`), `connection closed` on the client (`peer`, `up`, `down`, `dur`), `draining` (`active`, `timeout`), `target unreachable` (warn), `shutdown complete`, `drain interrupted, connections closed` (warn). Handshake and protocol rejections log at debug. The secret is never logged.
+Logging: `log/slog` with structured key/value fields, written to stdout as an event stream. Field order is fixed so events can be read down a column: `peer` first, then the request facts, then `err` on a failure, and `target` last on every line that has one. Key events: `tunnel opened` (`peer`, `proto` = `socks5`, `socks4`, `http`, `http-connect`, then `target`), `connection closed` on the client (`peer`, then `up` and `down` in MB with three decimals and the unit on the value, where MB is 10^6 bytes, then `dur`), `server listening`, `client listening`, `draining` (`active`, `timeout`), `target unreachable` (warn), `shutdown complete`, `drain interrupted, connections closed` (warn). Handshake and protocol rejections log at debug. The secret is never logged.
 
 `peer` means different things on each side, because each side sees a different hop. On the server it is the tunnel client's address plus `target` and `proto`. On the client it is the local application's address, and there is no `target`: the client pipes bytes without parsing the request, so the destination is only known to the server. Target host names and ports are logged by the server as the audit trail — one client-side line never reveals a destination — so treat a server's log stream as sensitive when it leaves the host.
 
@@ -357,7 +372,7 @@ Auto-update restart takes the same path before re-exec.
 
 ## 10. Key Design Decisions
 
-1. **Fake SMTP handshake** — first bytes look like a mail session to naive DPI.
+1. **Fake SMTP handshake** — the first bytes are a complete, RFC 5321-conformant envelope (`220`/`EHLO`/`MAIL`/`RCPT`/`DATA`/`354`) that a real server would accept, so naive DPI sees a routine mail transaction rather than a bespoke protocol. See §2.
 2. **Cipher choice is explicit** — `--cipher aes` (the default) gives AES-256-GCM confidentiality and integrity; `--cipher xor` is obfuscation only. Neither protects the application-to-client hop unless `--tls-cert`/`--tls-key` are set. A cipher mismatch fails the handshake or the first record, like a wrong secret.
 3. **Multiplexed sessions, pooled** — one TCP + handshake per session, many streams via smux, and the client keeps a small pool of sessions so aggregate throughput is not one connection's worth. Lower latency and fewer connections than one connection per local flow; a single flow still cannot exceed one session. See §1.1.
 4. **Protocols parsed server-side** — the client stays a dumb byte pipe, so detection on the server adds SOCKS4 and HTTP without changing the wire format. The only client-side parsing is the TLS ClientHello check, and only when a certificate is configured.
@@ -372,6 +387,7 @@ Auto-update restart takes the same path before re-exec.
 13. **Drain before close** — listeners stop first and connections finish on their own, bounded by `--drain-timeout`. A second signal forces. Container and orchestrator grace periods must exceed the drain timeout.
 14. **Socket options fixed in code** — `TCP_NODELAY`, keepalive and reuse flags are constants, not settings: one tested profile, no per-deployment tuning to get wrong. Send and receive buffers are left to the kernel, which autotunes them better than any fixed value. See [Socket options](#5-socket-options).
 15. **Doc comments** — Google Go style: a package comment per package, a doc comment starting with the name on every exported and non-trivial unexported symbol, bodies comment only the why.
-16. **Challenge-response handshake, stdlib crypto** — a per-connection nonce plus `HMAC-SHA256` proves the secret without sending it, and derives directional keys (`crypto/hmac`, `crypto/sha256`; no new dependency). The handshake still looks like `220`/`EHLO`/`DATA`. Cost: it is a wire break, so old and new binaries do not interoperate.
-17. **80% line rate to 1 Gbps, scoped to multiple streams** — the ceiling of one stream is `window / RTT`, and widening the 512KB window is a wire break for a gain the default 128-stream cap already covers. So the guarantee is stated per stream count and per RTT instead of as one per-connection number. Cost: a single long-fat connection underruns, and callers that open only one stream need to know that. See [Throughput](#throughput).
-18. **Benchmarks are informational** — `BenchmarkPipe`, `BenchmarkWrite` and `BenchmarkProxyThroughput` report numbers and never fail on speed, because a shared runner cannot give a stable threshold. Correctness stays covered by the ordinary tests, which is where a regression would show up first.
+16. **Challenge-response handshake, stdlib crypto** — a per-connection nonce plus `HMAC-SHA256` proves the secret without sending it, and derives directional keys (`crypto/hmac`, `crypto/sha256`; no new dependency). The proof travels as the `X-PROOF` parameter on `MAIL FROM` in unpadded base64, so every client line stays a valid RFC 5321 command and the envelope reads as ordinary mail. Cost: it is a wire break, so old and new binaries do not interoperate; client and server upgrade together.
+17. **Handshake replies match a real server** — a malformed line and a bad proof get identical `500` bytes, so no reply tells a probe which it sent; a command out of order gets `503`, `NOOP`/`RSET` get `250`, `VRFY`/`EXPN`/`HELP` get `502` (RFC 5321 §4.2.4: recognized but not implemented), an over-long line gets `500`, an opening command with no argument gets `501`, and a pre-`354` `QUIT` gets `221`. Cost: the session closes after the reply instead of staying open the way a real server does, and the state machine is observable — a prober learns the command order, which is public RFC knowledge and not the secret.
+18. **80% line rate to 1 Gbps, scoped to multiple streams** — the ceiling of one stream is `window / RTT`, and widening the 512KB window is a wire break for a gain the default 128-stream cap already covers. So the guarantee is stated per stream count and per RTT instead of as one per-connection number. Cost: a single long-fat connection underruns, and callers that open only one stream need to know that. See [Throughput](#throughput).
+19. **Benchmarks are informational** — `BenchmarkPipe`, `BenchmarkWrite` and `BenchmarkProxyThroughput` report numbers and never fail on speed, because a shared runner cannot give a stable threshold. Correctness stays covered by the ordinary tests, which is where a regression would show up first.

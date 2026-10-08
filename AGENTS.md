@@ -29,7 +29,7 @@ SOCKS4/5, HTTP and HTTPS proxy tunneled through a fake SMTP session, with a sele
 | **CLI** | `internal/cli/` — Cobra commands (`server`, `client`, `version`, `update`), env fallback, `mode.go` mode-from-env arg injection, `slog` logger, graceful drain |
 | **Config** | `internal/config/` — `Config` struct, `Validate()` |
 | **Update** | `internal/update/` — GitHub release lookup, sha256-verified download, self-replace, re-exec. `ShouldUpdate` adds tag-to-commit resolution (best effort) on top of `Newer`. `assetName` mirrors `.goreleaser.yml` archive names |
-| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, session pool (`--pool-min`/`--pool-max`), SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial, per-session stream cap (`--max-streams`, default 128). Handshake lines capped at 4KB. `Shutdown(ctx)` drains; `spawn` and `Shutdown` share a lock so no handler starts mid-drain, and `RunServer`/`RunClient` after `Shutdown` return an error. `handshake.go`: challenge-response + key derivation + capped line reads. `cipher.go`: XOR/AES stream selection. `mux.go`: smux config. `pool.go`: client session pool (client-only). `socket*.go`: fixed socket options (TCP_NODELAY, reuse, keepalive; send/receive buffers left to kernel autotuning), per-OS |
+| **Tunnel** | `internal/tunnel/` — `Tunnel` struct. Client: local listener, session pool (`--pool-min`/`--pool-max`), SMTP handshake. Server: SMTP handshake, per-stream protocol detection + negotiation + dial, per-session stream cap (`--max-streams`, default 128). Handshake is a full RFC 5321 envelope (see [SMTP handshake](#smtp-handshake-rfc-5321)); lines capped at 4KB. `Shutdown(ctx)` drains; `spawn` and `Shutdown` share a lock so no handler starts mid-drain, and `RunServer`/`RunClient` after `Shutdown` return an error. `handshake.go`: envelope constants + challenge-response + key derivation + capped line reads. `cipher.go`: XOR/AES stream selection. `mux.go`: smux config. `pool.go`: client session pool (client-only). `socket*.go`: fixed socket options (TCP_NODELAY, reuse, keepalive; send/receive buffers left to kernel autotuning), per-OS |
 | **SOCKS5** | `pkg/socks5/` — server-side negotiation (v5, no-auth, CONNECT, IPv4/IPv6/domain) |
 | **SOCKS4** | `pkg/socks4/` — SOCKS4/4a request parser and reply writer (CONNECT only) |
 | **HTTP proxy** | `pkg/httpproxy/` — CONNECT and absolute-form parser, status writer, forwarder |
@@ -72,6 +72,19 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 - Changing archive names in `.goreleaser.yml` requires updating `assetName` in `internal/update/update.go`, or `update` breaks.
 - Handshake, cipher (XOR or AES), or smux changes must land in client and server together. Old and new binaries do not interoperate — say so in the commit message.
 
+### SMTP handshake (RFC 5321)
+- Wire is `220` / `EHLO <ehloHost>` / `250-` + `250 X-PROOF` / `MAIL FROM:<mailFrom> X-PROOF=<proof>` / `250 OK` / `RCPT TO:<rcptTo>` / `250 OK` / `DATA` / `354`. Constants live in `handshake.go`; never inline envelope strings elsewhere.
+- Commands are matched case-insensitively, and `HELO` is accepted in place of `EHLO` (§2.4, §4.1.1.1). The proof is the exception: it is unpadded base64 (RFC 5321 §4.1.1.2 excludes `=` from an `esmtp-value`) compared byte for byte, and only its value goes through `subtle.ConstantTimeCompare` — never the public prefix.
+- `EHLO` takes a hostname only, never the proof, and the server accepts any single argument: the name belongs to the client, and §4.1.4 lets a server compare it with the peer address but forbids refusing a message when that fails. A recognized opening verb with no argument gets `501`. The proof travels only as the `X-PROOF` esmtp-param.
+- Advertise only what is implemented: `X-PROOF` alone. Never re-add `STARTTLS`/`SIZE`/`8BITMIME`/`AUTH` without implementing them, and never advertise what would answer `502` (§4.2.4).
+- Reply mapping, one reply then close: `250` for `NOOP`/`RSET`, `502` for `VRFY`/`EXPN`/`HELP`, `501` for an opening verb with no argument, `500` for a malformed line, an over-long line or a bad proof (identical bytes for the last two), `503` for a command out of order, `221` for a pre-`354` `QUIT`. Silent close only on I/O error, timeout or peer close.
+- The `503` positions are exact: a transaction verb before `EHLO`, `RCPT`/`DATA` before `MAIL`, a second `MAIL` (or `DATA`) at the recipient stage, and anything but `DATA` at the last step. Check the verb before the proof, so no reply depends on the secret.
+- `NOOP`, `RSET`, `VRFY`, `EXPN` and `HELP` are answered, not implemented, and the session closes after the reply where a real server keeps it open. Implementing one for real means implementing it fully, not stubbing it.
+- Lines end CRLF. A bare-LF line is malformed (§4.1.1.4) and is answered like any other malformed line.
+- The 4KB line cap is a lenient superset of the 512-octet command line limit (§4.5.3.1.4); an over-long line gets one `500` first (§4.2.2). The 30s handshake deadline is an operational bound, not the 5-minute minimum of §4.5.3.2.
+- DATA body stays raw tunnel bytes (no dot-stuffing, no terminator) as a documented deviation.
+- Any envelope or happy-path byte change is a hard break: client+server together, commit says so. Error-path-only alignment (this sweep) is compatible — an older client still works against a newer server.
+
 ### Update Semantics
 - The release tag is compared by `X.Y.Z` only (`Newer`); `ShouldUpdate` adds the same-tag-different-commit case. Both live in `internal/update/`; the CLI never compares versions itself.
 - An unknown commit (empty, or the linker's `none`) means "no opinion", never "different". A dirty running build skips the commit branch. Neither may trigger a reinstall, or the update loop never settles.
@@ -90,6 +103,8 @@ Every flag has an env var: `PROXY_OVER_SMTP_` + flag name uppercased, `-` to `_`
 ### Logging
 - Injected `*slog.Logger`, structured key/value fields, stdout event stream. Levels: `info` audit events, `warn` failures, `debug` rejections. No `log.Fatal` / `os.Exit` outside `cmd/`. Never log the secret.
 - `peer` is per-hop: the server logs the tunnel client plus `target` and `proto`; the client logs only the local application's IP:port with `up`/`down`/`dur`. A client line must never name a target — the client does not parse the request, and a client log has to be safe to ship off-host.
+- Field order is fixed on both sides: `peer` first, request facts next, `err` before it on a failure, and `target` last on any line that carries one. The order is the format, so a reader can follow one column down the event stream.
+- The client's `up`/`down` are MB with three decimals and the unit on the value (`megabytes` in `client.go`), where MB is 10^6 bytes. Never print a bare byte count: a log reader should not have to convert units.
 
 ### Config
 - Twelve-factor: config only from flags and env, no baked-in secret, every new flag gets an env var automatically via `internal/cli/env.go`. No config files.

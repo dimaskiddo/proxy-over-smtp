@@ -70,7 +70,7 @@ flowchart TD
 ### 2. Server (`internal/tunnel/server.go`)
 
 1. Listen on `--listen` through the tuned listener (`t.listen`: buffers, reuse, keepalive, see [ARCHITECTURE.md](ARCHITECTURE.md#5-socket-options)). `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
-2. Per accepted connection (tracked in `conns`): 30s deadline, challenge-response SMTP handshake that proves the secret with an HMAC (see [ARCHITECTURE.md](ARCHITECTURE.md#2-handshake-fake-smtp-challenge-response)). Every handshake line is capped at 4KB, so an oversized `EHLO` is rejected instead of buffered.
+2. Per accepted connection (tracked in `conns`): 30s deadline, then the RFC 5321 envelope — `220` with a fresh nonce, `EHLO [192.0.2.10]`, `MAIL FROM:<no-reply@gmail.com> X-PROOF=<proof>`, `RCPT TO:<no-reply@gmail.com>`, `DATA`, `354`. The proof is an HMAC of the secret in unpadded base64, and the server folds the fixed part of the line, then compares the proof value in constant time (see [ARCHITECTURE.md](ARCHITECTURE.md#2-handshake-fake-smtp-challenge-response)). Lines must end CRLF (§4.1.1.4), commands are matched case-insensitively and `HELO` is accepted in place of `EHLO`, both as RFC 5321 §2.4 and §4.1.1.1 require. The opening argument is accepted whatever it says — it names the client, and §4.1.4 forbids refusing a message over it — so a recognized verb with no argument is the only case left, and it gets `501`. Every handshake line is capped at 4KB, so an oversized `EHLO` is answered with `500` and dropped instead of buffered.
 3. Clear the deadline, wrap in the `--cipher` stream (`xorstream.New(rw, secret)` or `aesstream.New(rw, s2c, c2s)`), start `smux.Server`.
 4. Loop on `sess.AcceptStream()`. Once draining starts, new streams are closed at once and the session closes when its last stream ends. Streams beyond `--max-streams` are also closed at once, so a peer cannot hold unbounded handlers. Per stream, in its own tracked goroutine with a 30s deadline until the reply is sent:
 
@@ -85,7 +85,7 @@ sequenceDiagram
     C->>S: request (SOCKS greeting + request, or HTTP request line + headers)
     S->>T: dial (30s, ACL after DNS, then socket options)
     S->>C: SOCKS reply, or 200 for CONNECT, or error status
-    Note over S: log: tunnel opened peer, target, proto
+    Note over S: log: tunnel opened peer, proto, target
     C-->>T: relay.PipeCount both ways
 ```
 
@@ -97,8 +97,8 @@ For plain HTTP (absolute-form) there is no `200`: the server rewrites the reques
 
 1. Listen on `--listen` through the same tuned listener. `context.AfterFunc` closes the listener when the run context is cancelled (stop accepting only).
 2. Per accepted local connection (tracked in `conns`): 30s deadline, peek the first byte. If it is `0x16` and `--tls-cert`/`--tls-key` are set, terminate TLS (handshake bound by the same deadline). If it is `0x16` without a certificate, close with debug log `tls not enabled`. Then `pickSlot`.
-3. `pickSlot` reserves a stream on the healthy slot carrying the fewest streams. When every slot is loaded (`max(4, max-streams/8)` streams each) and the pool is below `--pool-max`, it dials another: `--remote` (30s, tuned dialer, cancelled by shutdown), client handshake, `--cipher` stream wrap, `smux.Client`. Growth is single-flight per slot, so concurrent local connections wait for the dial in progress and then take the least loaded slot. Closed slots are dropped on every pick; a stream open that fails removes its slot and retries on another.
-4. `relay.PipeCount(local, stream)`. The application's proxy bytes (decrypted when TLS was terminated) travel unchanged to the server. When the relay ends, one line is logged: `connection closed` with `peer` (the local application), `up`, `down` and `dur`. The client never parses the request, so no target appears in any client line.
+3. `pickSlot` reserves a stream on the healthy slot carrying the fewest streams. When every slot is loaded (`max(4, max-streams/8)` streams each) and the pool is below `--pool-max`, it dials another: `--remote` (30s, tuned dialer, cancelled by shutdown), the client side of the SMTP envelope (`220` → `EHLO` → `MAIL … X-PROOF=` → `RCPT` → `DATA` → `354`), `--cipher` stream wrap, `smux.Client`. Growth is single-flight per slot, so concurrent local connections wait for the dial in progress and then take the least loaded slot. Closed slots are dropped on every pick; a stream open that fails removes its slot and retries on another.
+4. `relay.PipeCount(local, stream)`. The application's proxy bytes (decrypted when TLS was terminated) travel unchanged to the server. When the relay ends, one line is logged: `connection closed` with `peer` (the local application), `up`, `down` and `dur`. The byte totals are rendered in MB (10^6 bytes, three decimals, unit included), so a transferred volume reads without a unit conversion. The client never parses the request, so no target appears in any client line.
 5. Closing that stream releases its slot reservation. If the slot is now empty it records the time, and the shrink scan that runs on every stream close drops any slot idle for 60s, down to `--pool-min`.
 
 ### 4. Update (`internal/update/`, `internal/cli/update.go`)
@@ -181,9 +181,13 @@ Cipher stays `--cipher aes` for these: both ciphers measure the same end to end 
 
 | Scenario | Recovery |
 |---|---|
-| Handshake fails or times out (30s) | Connection closed, no reply. Logged at debug (`handshake rejected`) |
-| Wrong proof or malformed nonce | Connection closed, no reply. Debug log `handshake rejected` |
-| Handshake line over 4KB, or over 16 `250-` replies | Connection closed, no reply. Debug log `handshake rejected` |
+| Malformed line (including one ended by a bare LF), over-long line, or bad proof | `500 Syntax error, command unrecognized`, then close. Identical bytes every way, so none is distinguishable. Debug log `handshake rejected` |
+| `NOOP` or `RSET` before `354` | `250 OK`, then close: the command is acknowledged even though the session ends. Debug log `handshake rejected` |
+| `VRFY`, `EXPN` or `HELP` before `354` | `502 Command not implemented`, then close. Debug log `handshake rejected` |
+| `EHLO`/`HELO` with no argument, or with more than one | `501 Syntax error in parameters or arguments`, then close. Debug log `handshake rejected` |
+| Command out of order: a transaction verb before `EHLO`, `RCPT` or `DATA` before `MAIL`, a second `MAIL` (or `DATA`) at the recipient stage, or anything but `DATA` at the last step | `503 Bad sequence of commands`, then close. Debug log `handshake rejected` |
+| `QUIT` before `354`, in any case and with or without arguments | `221 Bye`, clean close. Debug log `handshake rejected` |
+| Handshake I/O error, timeout (30s), peer close, malformed nonce, or over 16 `250-` replies | Connection closed, no reply (no reply is meaningful). Debug log `handshake rejected` |
 | Cipher differs between ends | Handshake succeeds, then the first AES record fails to open: slot evicted, next local connection re-dials |
 | AES record fails authentication (wrong key, tampered data, lost position) | Stream error, slot evicted. Warn `open stream failed` on the client |
 | Client cannot dial server or handshake fails | Log `open stream failed` (warn) with `err`, local connection closed. An existing slot still takes the stream; otherwise the next local connection retries |
@@ -221,3 +225,5 @@ Cipher stays `--cipher aes` for these: both ciphers measure the same end to end 
 | Binary location not writable | Error with permission hint, binary untouched |
 | Re-exec fails after a successful swap | `restart:` on stderr, exit 1. New binary is on disk: start it manually |
 | `--update-interval` below 1h | Exit 1 at startup |
+
+Every handshake reply above is the last line the session sends. A real mail server keeps the connection open after `250`, `500`, `501`, `502` or `503`; this one closes, so a probe gets one answer per connection and has to reconnect to learn anything more.

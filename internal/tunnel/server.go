@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -220,7 +221,8 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 	d := dialer(t.dialControl)
 	dest, err := d.DialContext(ctx, "tcp", target)
 	if err != nil {
-		t.log.Warn("target unreachable", "target", target, "proto", proto, "err", err)
+		// target stays the last attribute so it lines up down the column on the audit stream.
+		t.log.Warn("target unreachable", "proto", proto, "err", err, "target", target)
 		t.replyFailure(vs, proto, err)
 		return
 	}
@@ -234,7 +236,7 @@ func (t *Tunnel) handleStream(ctx context.Context, peer net.Addr, vs *smux.Strea
 		return
 	}
 
-	t.log.Info("tunnel opened", "peer", peer.String(), "target", target, "proto", proto)
+	t.log.Info("tunnel opened", "peer", peer.String(), "proto", proto, "target", target)
 	relay.Pipe(&bufConn{r: br, Conn: vs}, dest)
 }
 
@@ -271,9 +273,53 @@ func (t *Tunnel) replyFailure(vs *smux.Stream, proto string, err error) {
 	}
 }
 
-// serverHandshake plays the server side of the fake SMTP session. It sends a fresh nonce,
-// verifies the client's HMAC proof against the secret in constant time, and returns the nonce so
-// the caller can derive the stream keys. Any failure closes the connection with no reply.
+// readStage reads one command line and answers the commands that end the session at any stage:
+// NOOP and RSET are acknowledged, VRFY, EXPN and HELP are refused as unimplemented, and QUIT is
+// answered inside readCommand. It returns errUnsupported or errQuit once the reply is on the wire,
+// so a stage only ever sees the lines it is meant to act on.
+func readStage(w io.Writer, r *bufio.Reader, stage string) (string, error) {
+	line, err := readCommand(w, r)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", stage, err)
+	}
+
+	reply, ok := probeReply(line)
+	if !ok {
+		return line, nil
+	}
+
+	if err := reject(w, reply, errUnsupported); err != nil {
+		return "", fmt.Errorf("read %s: %w", stage, err)
+	}
+
+	return "", fmt.Errorf("read %s: %w", stage, errUnsupported)
+}
+
+// probeReply returns the reply that ends the session for a command a real server answers but does
+// not act on, and whether line is one of them. NOOP and RSET change no transaction state, so 250 is
+// the honest answer; VRFY, EXPN and HELP are refused as unimplemented rather than unrecognized,
+// because a real server knows them and only declines to offer them. A real server keeps the session
+// open after either; this one closes, so a probe gets one answer and nothing more.
+func probeReply(line string) (string, bool) {
+	switch {
+	case isCommand(line, "NOOP"), isCommand(line, "RSET"):
+		return replyOK, true
+	case isCommand(line, "VRFY"), isCommand(line, "EXPN"), isCommand(line, "HELP"):
+		return replyUnimplemented, true
+	}
+
+	return "", false
+}
+
+// serverHandshake plays the server side of the fake SMTP session. It sends a fresh nonce in the
+// greeting, walks the client through an envelope a real server would accept, and checks the HMAC
+// proof carried as the X-PROOF parameter on MAIL FROM in constant time, returning the nonce so the
+// caller can derive the stream keys. Commands are case-insensitive (RFC 5321 §2.4) and HELO is
+// taken as an EHLO alias, so the session reads as an ordinary relay to anything watching. A bad
+// proof is answered with the same 500 as a malformed line, so no reply tells a probe which it sent;
+// a command out of order gets 503, and an EHLO whose argument is missing gets 501. Any other
+// argument is accepted, since it names the client and §4.1.4 forbids refusing mail over it. Only a
+// failure with no reply to give closes without one.
 func (t *Tunnel) serverHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error) {
 	if err := conn.SetDeadline(time.Now().Add(defaultTimeout)); err != nil {
 		return nil, fmt.Errorf("set deadline: %w", err)
@@ -284,34 +330,89 @@ func (t *Tunnel) serverHandshake(conn net.Conn, r *bufio.Reader) ([]byte, error)
 		return nil, err
 	}
 
-	if _, err := fmt.Fprintf(conn, "220 mail.google.com ESMTP %s\r\n", base64.StdEncoding.EncodeToString(nonce)); err != nil {
+	if _, err := fmt.Fprintf(conn, "220 %s ESMTP %s\r\n", mailHost, base64.StdEncoding.EncodeToString(nonce)); err != nil {
 		return nil, fmt.Errorf("write 220: %w", err)
 	}
 
-	line, err := readLine(r, maxLine)
+	line, err := readStage(conn, r, "ehlo")
 	if err != nil {
-		return nil, fmt.Errorf("read ehlo: %w", err)
+		return nil, err
 	}
 
-	want := "EHLO " + proofValue(t.cfg.Secret, nonce)
-	if subtle.ConstantTimeCompare([]byte(line), []byte(want)) != 1 {
-		return nil, errAuth
+	// A transaction command before the greeting is out of order, not unrecognized.
+	if isCommand(line, "MAIL") || isCommand(line, "RCPT") || isCommand(line, "DATA") {
+		return nil, reject(conn, replySequence, errSequence)
 	}
 
-	if _, err := fmt.Fprintf(conn, "250-OK\r\n250 STARTTLS\r\n"); err != nil {
-		return nil, fmt.Errorf("write 250: %w", err)
+	// A verb this server does not know is the same 500 any unusable line gets. A verb it does know
+	// with the argument missing is the parameter error a real relay answers a bare EHLO with, which
+	// keeps the reply honest about the command without ever judging the name the client gives.
+	if !isCommand(line, "EHLO") && !isCommand(line, "HELO") {
+		return nil, reject(conn, replySyntax, errAuth)
 	}
 
-	line, err = readLine(r, maxLine)
+	if !ehloArgument(line) {
+		return nil, reject(conn, replyParam, errAuth)
+	}
+
+	if _, err := fmt.Fprintf(conn, "250-%s\r\n250 %s\r\n", mailHost, extKeyword); err != nil {
+		return nil, fmt.Errorf("write ehlo reply: %w", err)
+	}
+
+	line, err = readStage(conn, r, "mail")
 	if err != nil {
-		return nil, fmt.Errorf("read data: %w", err)
+		return nil, err
 	}
 
-	if line != "DATA" {
-		return nil, errors.New("invalid data command")
+	// A recipient or DATA before the sender is a sequence error, not a bad line, so the verb is
+	// checked before the proof: what the reply says depends on the command, never on the secret.
+	if isCommand(line, "RCPT") || isCommand(line, "DATA") {
+		return nil, reject(conn, replySequence, errSequence)
 	}
 
-	if _, err := fmt.Fprintf(conn, "354 Go ahead\r\n"); err != nil {
+	if !hasPrefixFold(line, mailPrefix) {
+		return nil, reject(conn, replySyntax, errAuth)
+	}
+
+	// The prefix is a public constant; only the value appended to it is secret, so only that
+	// comparison is kept free of early returns.
+	if subtle.ConstantTimeCompare([]byte(line[len(mailPrefix):]), []byte(proofValue(t.cfg.Secret, nonce))) != 1 {
+		return nil, reject(conn, replySyntax, errAuth)
+	}
+
+	if _, err := io.WriteString(conn, replyOK+"\r\n"); err != nil {
+		return nil, fmt.Errorf("write mail reply: %w", err)
+	}
+
+	line, err = readStage(conn, r, "rcpt")
+	if err != nil {
+		return nil, err
+	}
+
+	// A second sender would restart the transaction, which this session does not support; a real
+	// server calls that a sequence error, and so does this one.
+	if isCommand(line, "MAIL") || isCommand(line, "DATA") {
+		return nil, reject(conn, replySequence, errSequence)
+	}
+
+	if !strings.EqualFold(line, rcptLine) {
+		return nil, reject(conn, replySyntax, errAuth)
+	}
+
+	if _, err := io.WriteString(conn, replyOK+"\r\n"); err != nil {
+		return nil, fmt.Errorf("write rcpt reply: %w", err)
+	}
+
+	line, err = readStage(conn, r, "data")
+	if err != nil {
+		return nil, err
+	}
+
+	if !isCommand(line, "DATA") {
+		return nil, reject(conn, replySequence, errSequence)
+	}
+
+	if _, err := io.WriteString(conn, "354 End data with <CR><LF>.<CR><LF>\r\n"); err != nil {
 		return nil, fmt.Errorf("write 354: %w", err)
 	}
 

@@ -22,13 +22,13 @@ The command line changed completely. Old command lines no longer work: Cobra rej
 | `AUDIT: ...` plain text lines | `slog` structured lines (`--log-format text` or `json`) |
 | `-allow-private` | `server --allow-private` |
 
-**Client and server must be upgraded together.** The tunnel now uses smux protocol v2 (per-stream flow control) and a challenge-response handshake, so old and new binaries do not interoperate.
+**Client and server must be upgraded together.** The tunnel uses smux protocol v2 (per-stream flow control) and a challenge-response handshake. The handshake is now a real RFC 5321 envelope with the proof carried as the `X-PROOF` parameter on `MAIL FROM`, so old and new binaries do not interoperate on any of the three counts. The RFC alignment sweep on top of it — case-insensitive verbs, `HELO`, any EHLO argument, the `250`/`502`/`500`/`501`/`503` reply mapping — changed only error-path replies, so an older client still works against a newer server.
 
 ---
 
 ## ✨ Why Proxy-Over-SMTP?
 
-*   **🎭 SMTP Disguise:** Every connection opens with a plausible `220` / `EHLO` / `DATA` exchange before tunneling starts.
+*   **🎭 SMTP Disguise:** Every connection opens with a plausible RFC 5321 mail transaction — `220` / `EHLO` / `MAIL FROM` / `RCPT TO` / `DATA` / `354` — with the HMAC proof hidden in an ESMTP parameter. Commands are case-insensitive and `HELO` is accepted as an alias for `EHLO`, the way a real relay answers. A failure gets the reply a real server gives it: `250` for `NOOP`/`RSET`, `502` for `VRFY`/`EXPN`/`HELP`, `500` for a malformed line, an over-long line or a bad proof, `501` for an opening command whose argument is missing, `503` for a command out of order, `221` for `QUIT`. Only an I/O error, a timeout or a peer that closes without a word passes silently, and every reply is the last thing the session sends.
 *   **🔐 Selectable Cipher:** `--cipher aes` (default) wraps the tunnel in AES-256-GCM records for confidentiality and integrity; `--cipher xor` keeps a fast rolling-key XOR for obfuscation only.
 *   **🤝 Challenge-Response Handshake:** The server sends a fresh nonce and the client answers with an HMAC of the secret. The secret is never sent on the wire, and both stream keys are derived from it per connection.
 *   **⚡ Multiplexed Tunnel:** One TCP connection carries many streams via [smux](https://github.com/xtaci/smux), with keepalive, for low latency and fewer handshakes.
@@ -265,12 +265,12 @@ Notes:
 Logs are an event stream on stdout. Redirect or collect them with your process manager (Docker, systemd, Kubernetes). `--log-file` additionally appends to a file.
 
 ```
-time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113.5:56810 target=example.com:443 proto=socks5
-time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" target=10.0.0.1:80 err="dial tcp 10.0.0.1:80: target address not allowed"
-time=2026-10-07T17:10:33.514+07:00 level=INFO msg="connection closed" peer=127.0.0.1:49822 up=1048576 down=0 dur=1.204s
+time=2026-10-07T17:10:31.227+07:00 level=INFO msg="tunnel opened" peer=203.0.113.5:56810 proto=socks5 target=example.com:443
+time=2026-10-07T17:10:32.242+07:00 level=WARN msg="target unreachable" proto=socks5 err="dial tcp 10.0.0.1:80: target address not allowed" target=10.0.0.1:80
+time=2026-10-07T17:10:33.514+07:00 level=INFO msg="connection closed" peer=127.0.0.1:49822 up="1.049 MB" down="0.000 MB" dur=1.204s
 ```
 
-The first two lines are the server; the third is the client. `tunnel opened` and `connection closed` are the two audit lines: the server names the destination, the client names the local application that used the proxy and how much it moved. The client does not parse the request, so its line never contains a target — the destination stays on the server, and a client's log can leave the host without carrying browsing destinations.
+The first two lines are the server; the third is the client. `tunnel opened` and `connection closed` are the two audit lines: the server names the destination, the client names the local application that used the proxy and how much it moved. Field order is part of the format on both sides: `peer` first, `target` last on every line that carries it, so the destination starts at the same column down a page of events. The client's `up` and `down` are printed as megabytes, always three decimals and always the `MB` suffix, where MB is 10^6 bytes — the unit on the label is the unit of the number. The client does not parse the request, so its line never contains a target — the destination stays on the server, and a client's log can leave the host without carrying browsing destinations.
 
 `--log-format json` emits the same events as JSON lines. Handshake and protocol rejections appear at `--log-level debug`. The secret is never logged, on either side.
 
